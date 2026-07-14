@@ -222,7 +222,9 @@ def score_job_fit(job_text, cv_skills):
     return score, matched
 
 
-ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "myworkdayjobs.com", "workday.com")
+ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "myworkdayjobs.com",
+             "workday.com", "workable.com", "personio.de", "teamtailor.com", "jobvite.com",
+             "breezy.hr", "recruitee.com")
 
 TECH_VOCAB = [
     "Python", "JavaScript", "TypeScript", "Java", "Go", "Golang", "Rust", "Ruby", "PHP", "Scala",
@@ -395,6 +397,21 @@ def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
 CAREER_SITE_FILTER = "(site:lever.co OR site:greenhouse.io OR site:ashbyhq.com OR site:workday.com OR site:jobs.smartrecruiters.com)"
 ALT_CAREER_SITE_FILTER = "(site:workable.com OR site:personio.de OR site:teamtailor.com OR site:jobvite.com OR site:breezy.hr OR site:recruitee.com)"
 
+# Aggregators/job boards to actively keep out — these kept slipping through the old
+# unrestricted fallback query, which is what caused most results to be board listings
+# instead of a company's own career page.
+AGGREGATOR_DOMAINS = [
+    "indeed.com", "linkedin.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
+    "careerbuilder.com", "simplyhired.com", "jooble.org", "talent.com", "stepstone.",
+    "totaljobs.com", "reed.co.uk", "cwjobs.co.uk", "adzuna.", "jobrapido.com",
+    "jobisjob.", "careerjet.", "neuvoo.", "jobted.", "welcometothejungle.com",
+]
+
+
+def _is_aggregator(href):
+    href_low = (href or "").lower()
+    return any(dom in href_low for dom in AGGREGATOR_DOMAINS)
+
 
 def _try_query(ddgs, query, max_results):
     """Run one query, returning (hits, error_message_or_None)."""
@@ -406,14 +423,19 @@ def _try_query(ddgs, query, max_results):
 
 
 def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SITE_FILTER, query_extra=""):
-    """Search each country with a narrow (site-restricted) query first; if that comes back
-    empty, retry once with a broader query before giving up on that country. Most of the
-    'No results found' failures came from the narrow query genuinely being too strict for
-    that country/backend combo, not purely rate limiting — so a fallback query recovers a
-    lot of them. A jittered delay between countries also reduces rate-limit hits.
-    `site_filter`/`query_extra` let callers target a different set of ATS hosts (e.g. for
-    'load more') so repeated searches surface new postings instead of the same top hits."""
+    """Three-tier search per country, from strictest to loosest:
+      1. Narrow: only the requested ATS host set (e.g. lever/greenhouse).
+      2. Medium: BOTH known ATS host sets combined — recovers a lot of the empty-result
+         cases without giving up the site restriction entirely.
+      3. Open, as a last resort: no site restriction, but explicitly excludes the known
+         job-board aggregators via '-site:' terms, and results are still hard-filtered
+         against AGGREGATOR_DOMAINS afterward as a safety net.
+    This replaced a version whose fallback query had no site restriction at all, which is
+    why most results were coming from Indeed/LinkedIn/Glassdoor instead of a company's own
+    career page."""
     results, errors = [], []
+    exclude_terms = " ".join(f"-site:{d.rstrip('.')}" for d in AGGREGATOR_DOMAINS)
+
     with DDGS() as ddgs:
         for i, country in enumerate(countries):
             time.sleep(0.5 + 0.2 * (i % 3))
@@ -423,10 +445,18 @@ def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SI
 
             if not hits:
                 time.sleep(0.6)
-                broad_query = f"{role} jobs {country} careers {query_extra}".strip()
-                hits, err2 = _try_query(ddgs, broad_query, max_results_per_query)
+                combined_filter = f"({CAREER_SITE_FILTER.strip('()')} OR {ALT_CAREER_SITE_FILTER.strip('()')})"
+                medium_query = f'{combined_filter} "{role}" {country} {query_extra}'.strip()
+                hits, err2 = _try_query(ddgs, medium_query, max_results_per_query)
                 if not hits and err2:
                     err = err2
+
+            if not hits:
+                time.sleep(0.6)
+                open_query = f"{role} jobs {country} careers {exclude_terms} {query_extra}".strip()
+                hits, err3 = _try_query(ddgs, open_query, max_results_per_query)
+                if not hits and err3:
+                    err = err3
 
             if not hits and err:
                 errors.append(f"{country}: {err}")
@@ -434,11 +464,11 @@ def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SI
                 h["_country"] = country
             results.extend(hits)
 
-    # dedupe by href
+    # dedupe by href, and hard-filter out any aggregator that slipped through
     seen, deduped = set(), []
     for r in results:
         href = r.get("href") or r.get("url")
-        if not href or href in seen:
+        if not href or href in seen or _is_aggregator(href):
             continue
         seen.add(href)
         r["href"] = href
