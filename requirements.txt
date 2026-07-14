@@ -3,5 +3,5 @@ groq
 pypdf
 pandas
 requests
-pylatexenc
 duckduckgo-search
+plotly
