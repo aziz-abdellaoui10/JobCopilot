@@ -1,0 +1,6 @@
+streamlit
+groq
+pypdf
+pandas
+requests
+pylatexenc
