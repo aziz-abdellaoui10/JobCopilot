@@ -23,7 +23,6 @@ import time
 from datetime import datetime, timedelta
 
 import pandas as pd
-import plotly.graph_objects as go
 import pypdf
 from groq import Groq
 
@@ -73,6 +72,14 @@ DB_PATH = "copilot_db.json"
 DEFAULT_COUNTRIES = ["Germany", "Netherlands", "United Kingdom", "Belgium", "France",
                      "Switzerland", "Ireland", "Spain", "Portugal", "Canada"]
 
+COUNTRY_FLAGS = {
+    "Germany": "🇩🇪", "Netherlands": "🇳🇱", "United Kingdom": "🇬🇧", "Belgium": "🇧🇪",
+    "France": "🇫🇷", "Switzerland": "🇨🇭", "Ireland": "🇮🇪", "Spain": "🇪🇸",
+    "Portugal": "🇵🇹", "Canada": "🇨🇦", "Poland": "🇵🇱", "Czech Republic": "🇨🇿",
+}
+
+VISA_ICON = {"green": "✅", "yellow": "⚠️", "red": "❌"}
+
 DEFAULT_DB = {
     "profile": {
         "role": "Software Engineer",
@@ -82,13 +89,16 @@ DEFAULT_DB = {
         "work_mode": "Hybrid",
         "avoid_industries": "",
         "lifestyle": "Single, mid-tier city",
+        "nationality": "",
+        "visa_status": "EU/EEA citizen (no visa needed)",
+        "languages": "English",
     },
     "cv_text": "",
     "tex_source": "",
     "cv_skills": [],
     "cv_meta_updated": None,
     "companies": {},        # id -> role/company record incl. liked/status/date
-    "country_cache": {},    # country -> {fit, salary_eur, col_eur, surplus_eur, note, updated_at}
+    "country_cache": {},    # country -> ranking/market data, see refresh_country_data
 }
 
 
@@ -98,9 +108,11 @@ def load_db():
     try:
         with open(DB_PATH, "r") as f:
             data = json.load(f)
-        # backfill any missing keys if the schema grows
+        # backfill any missing top-level and nested profile keys as the schema grows
         for k, v in DEFAULT_DB.items():
             data.setdefault(k, v)
+        for k, v in DEFAULT_DB["profile"].items():
+            data["profile"].setdefault(k, v)
         return data
     except Exception:
         return json.loads(json.dumps(DEFAULT_DB))
@@ -171,6 +183,39 @@ def score_job_fit(job_text, cv_skills):
     return score, matched
 
 
+ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "myworkdayjobs.com", "workday.com")
+
+TECH_VOCAB = [
+    "Python", "JavaScript", "TypeScript", "Java", "Go", "Golang", "Rust", "Ruby", "PHP", "Scala",
+    "Kotlin", "Swift", "C++", "C#", ".NET", "Node.js", "React", "Vue", "Angular", "Next.js",
+    "Django", "Flask", "FastAPI", "Spring", "Rails", "AWS", "GCP", "Azure", "Docker", "Kubernetes",
+    "Terraform", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Kafka", "GraphQL", "REST",
+    "Machine Learning", "TensorFlow", "PyTorch",
+]
+
+
+def extract_company_name(href):
+    """Prefer the real company name over the ATS/aggregator domain when the link is hosted
+    on a third-party applicant-tracking system."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(href)
+        netloc = parsed.netloc.replace("www.", "")
+        if any(h in netloc for h in ATS_HOSTS):
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts:
+                return parts[0].replace("-", " ").replace("_", " ").title()
+        return netloc.split(".")[0].replace("-", " ").title()
+    except Exception:
+        return "Unknown company"
+
+
+def extract_tech_stack(title, body):
+    text = f"{title} {body}"
+    found = [t for t in TECH_VOCAB if re.search(rf"\b{re.escape(t)}\b", text, re.IGNORECASE)]
+    return ", ".join(found[:5]) if found else "—"
+
+
 # --------------------------------------------------------------------------------------
 # SCOUTING ENGINE — searches company career pages, prefers first-party links over boards
 # --------------------------------------------------------------------------------------
@@ -230,46 +275,92 @@ def search_roles(role, countries, max_results_per_query=8):
 # --------------------------------------------------------------------------------------
 def refresh_country_data(countries, role, seniority):
     client = get_client()
+    prof = db["profile"]
     with DDGS() as ddgs:
         for country in countries:
             try:
                 snippets = list(ddgs.text(
-                    f"average {seniority} {role} salary {country} 2026 cost of living", max_results=5
+                    f"average {seniority} {role} salary {country} 2026 cost of living work visa", max_results=5
                 ))
             except Exception:
                 snippets = []
             context = "\n".join(f"- {s.get('title','')}: {s.get('body','')}" for s in snippets)[:3500]
 
             prompt = (
-                f"Based on these web search snippets about {role} ({seniority}) salaries and cost of "
-                f"living in {country}, estimate: average gross annual salary in EUR for this role/level, "
-                f"and average annual cost of living in EUR for a '{st.session_state.db['profile']['lifestyle']}' "
-                f"lifestyle. If the snippets are insufficient, use your best general knowledge and say so. "
-                'Return ONLY JSON: {"salary_eur": int, "col_eur": int, "note": "1 sentence on data basis"}\n\n'
+                f"You are estimating how well {country} fits THIS specific candidate for a "
+                f"{seniority} {role} role. Candidate facts — nationality: {prof.get('nationality') or 'not specified'}; "
+                f"visa situation: {prof['visa_status']}; languages spoken: {prof.get('languages', 'English')}; "
+                f"lifestyle assumption for cost of living: '{prof['lifestyle']}'.\n\n"
+                f"Using the web search snippets below (and general knowledge if snippets are thin), estimate:\n"
+                f"- salary_eur: average gross ANNUAL salary in EUR for this role/level in {country}\n"
+                f"- col_eur: average ANNUAL cost of living in EUR for the stated lifestyle\n"
+                f"- monthly_surplus_low / monthly_surplus_high: a realistic MONTHLY surplus range in EUR "
+                f"(salary minus cost of living, divided by 12, with some realistic spread)\n"
+                f"- visa_speed_weeks: a short string like '2-4 weeks' reflecting how fast THIS candidate "
+                f"(given their stated nationality/visa situation) could realistically get authorized to work there. "
+                f"If they're already an EU/EEA citizen and the country is in the EU/EEA, speed should reflect that "
+                f"no visa is needed at all — say so explicitly.\n"
+                f"- visa_favorability: 'green' (fast/no visa needed), 'yellow' (moderate/some friction), or "
+                f"'red' (slow or restrictive) — from THIS candidate's perspective specifically\n"
+                f"- qol_stars: overall quality of life, integer 1-5\n"
+                f"- remote_culture_stars: how strong remote/hybrid work culture is in this country's tech sector, integer 1-5\n"
+                f"- edge: ONE short phrase (under 10 words) on why this country specifically suits or doesn't "
+                f"suit THIS candidate — reference their visa situation or languages if relevant (e.g. a language "
+                f"they speak unlocking a market, or their citizenship giving them fast/no-visa access)\n"
+                f"- note: one sentence on what the estimate is based on\n\n"
+                'Return ONLY JSON with exactly these keys: {"salary_eur": int, "col_eur": int, '
+                '"monthly_surplus_low": int, "monthly_surplus_high": int, "visa_speed_weeks": str, '
+                '"visa_favorability": "green"|"yellow"|"red", "qol_stars": int, "remote_culture_stars": int, '
+                '"edge": str, "note": str}\n\n'
                 f"SNIPPETS:\n{context if context else '(no search results found)'}"
             )
             try:
                 res = client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
+                    temperature=0.3,
                 )
                 raw = re.sub(r"^```json|```$", "", res.choices[0].message.content.strip(), flags=re.MULTILINE).strip()
                 parsed = json.loads(raw)
                 salary = int(parsed.get("salary_eur", 0))
                 col = int(parsed.get("col_eur", 0))
-                note = parsed.get("note", "")
+                entry = {
+                    "salary_eur": salary,
+                    "col_eur": col,
+                    "surplus_eur": (salary - col) if salary and col else None,
+                    "monthly_surplus_low": int(parsed.get("monthly_surplus_low", 0)),
+                    "monthly_surplus_high": int(parsed.get("monthly_surplus_high", 0)),
+                    "visa_speed_weeks": parsed.get("visa_speed_weeks", "—"),
+                    "visa_favorability": parsed.get("visa_favorability", "yellow"),
+                    "qol_stars": max(1, min(5, int(parsed.get("qol_stars", 3)))),
+                    "remote_culture_stars": max(1, min(5, int(parsed.get("remote_culture_stars", 3)))),
+                    "edge": parsed.get("edge", ""),
+                    "note": parsed.get("note", ""),
+                    "updated_at": datetime.now().isoformat(timespec="minutes"),
+                }
             except Exception as e:
-                salary, col, note = 0, 0, f"estimation failed: {e}"
-
-            db["country_cache"][country] = {
-                "salary_eur": salary,
-                "col_eur": col,
-                "surplus_eur": (salary - col) if salary and col else None,
-                "note": note,
-                "updated_at": datetime.now().isoformat(timespec="minutes"),
-            }
+                entry = {
+                    "salary_eur": 0, "col_eur": 0, "surplus_eur": None,
+                    "monthly_surplus_low": 0, "monthly_surplus_high": 0,
+                    "visa_speed_weeks": "—", "visa_favorability": "yellow",
+                    "qol_stars": 3, "remote_culture_stars": 3,
+                    "edge": "estimation failed", "note": str(e),
+                    "updated_at": datetime.now().isoformat(timespec="minutes"),
+                }
+            db["country_cache"][country] = entry
     save_db(db)
+
+
+def composite_priority_score(entry):
+    """Weighted score used only to order the ranking table — surplus, QoL, remote culture,
+    and visa favorability all contribute, which is why a high-salary/slow-visa country can
+    rank below a lower-salary/fast-visa one, matching how people actually prioritize moves."""
+    visa_bonus = {"green": 20, "yellow": 5, "red": -15}.get(entry.get("visa_favorability"), 0)
+    surplus_mid = (entry.get("monthly_surplus_low", 0) + entry.get("monthly_surplus_high", 0)) / 2
+    return surplus_mid * 0.5 + entry.get("qol_stars", 0) * 20 + entry.get("remote_culture_stars", 0) * 15 + visa_bonus
+
+
+
 
 
 # --------------------------------------------------------------------------------------
@@ -318,68 +409,110 @@ def compute_country_fit(country):
 # --------------------------------------------------------------------------------------
 # VIEW 1 — DASHBOARD
 # --------------------------------------------------------------------------------------
+def _stars(n):
+    n = max(0, min(5, int(n)))
+    return "★" * n + "☆" * (5 - n)
+
+
 def view_dashboard():
-    st.title("🌍 Country Fit & Salary Surplus")
+    st.title("🌍 Country Ranking")
     prof = db["profile"]
 
     countries = st.multiselect("Countries to evaluate", DEFAULT_COUNTRIES + prof["countries"],
                                 default=prof["countries"])
-    col_a, col_b = st.columns([1, 3])
-    with col_a:
-        if st.button("🔄 Refresh market data", use_container_width=True):
-            with st.spinner("Searching current salary & cost-of-living data..."):
-                refresh_country_data(countries, prof["role"], prof["seniority"])
-            st.rerun()
+    if st.button("🔄 Refresh market & visa data", use_container_width=False):
+        with st.spinner("Searching current salary, cost-of-living and visa data..."):
+            refresh_country_data(countries, prof["role"], prof["seniority"])
+        st.rerun()
 
-    if not db["companies"] and not db["country_cache"]:
-        st.info("No data yet — scout some roles in **Companies** and/or click **Refresh market data** here.")
+    cached = [c for c in countries if c in db["country_cache"]]
+    if not cached:
+        st.info("No ranking data yet — click **Refresh market & visa data** above to generate it "
+                "(estimates are personalized to your visa situation and languages in Profile).")
+    else:
+        ranked = sorted(cached, key=lambda c: composite_priority_score(db["country_cache"][c]), reverse=True)
+        medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+
+        st.subheader("Final Ranking Table — Your Profile Specific")
+        rows_html = ""
+        for i, country in enumerate(ranked):
+            d = db["country_cache"][country]
+            flag = COUNTRY_FLAGS.get(country, "🏳️")
+            priority = medals.get(i, str(i + 1))
+            surplus_range = f"€{d['monthly_surplus_low']:,}-{d['monthly_surplus_high']:,}" \
+                if d.get("monthly_surplus_high") else "—"
+            visa_icon = VISA_ICON.get(d.get("visa_favorability"), "⚠️")
+            rows_html += f"""
+            <tr style="border-top:1px solid {BORDER};">
+                <td style="padding:10px 8px;">{priority}</td>
+                <td style="padding:10px 8px;">{flag} {country}</td>
+                <td style="padding:10px 8px;">{surplus_range}</td>
+                <td style="padding:10px 8px;">{visa_icon} {d.get('visa_speed_weeks','—')}</td>
+                <td style="padding:10px 8px; color:#ffce54;">{_stars(d.get('qol_stars',0))}</td>
+                <td style="padding:10px 8px; color:#ffce54;">{_stars(d.get('remote_culture_stars',0))}</td>
+                <td style="padding:10px 8px; color:#c9cdd6;">{d.get('edge','')}</td>
+            </tr>"""
+
+        st.markdown(f"""
+        <table style="width:100%; border-collapse:collapse; font-size:14px;">
+            <tr style="color:#8b909c; text-align:left;">
+                <th style="padding:6px 8px;">Priority</th>
+                <th style="padding:6px 8px;">Country</th>
+                <th style="padding:6px 8px;">Est. Monthly Surplus</th>
+                <th style="padding:6px 8px;">Visa Speed</th>
+                <th style="padding:6px 8px;">QoL</th>
+                <th style="padding:6px 8px;">Remote/Hybrid Culture</th>
+                <th style="padding:6px 8px;">Your Edge</th>
+            </tr>
+            {rows_html}
+        </table>
+        """, unsafe_allow_html=True)
+
+        oldest = min(db["country_cache"][c]["updated_at"] for c in cached)
+        st.markdown(f'<span class="last-updated">Data as of {oldest} — AI-estimated from live web search '
+                    f'and your Profile (visa situation, languages), not a licensed data feed.</span>',
+                    unsafe_allow_html=True)
+
+    # --- Companies sub-table -------------------------------------------------------
+    st.divider()
+    filter_options = ["All countries"] + sorted({c["country"] for c in db["companies"].values()})
+    picked = st.selectbox("Companies for", filter_options,
+                           index=filter_options.index(st.session_state.get("dash_country_filter", "All countries"))
+                           if st.session_state.get("dash_country_filter") in filter_options else 0)
+    st.session_state["dash_country_filter"] = picked
+
+    entries = list(db["companies"].values())
+    if picked != "All countries":
+        entries = [c for c in entries if c["country"] == picked]
+
+    has_cv = bool(db["cv_skills"])
+    if has_cv:
+        entries.sort(key=lambda c: c.get("fit", 0), reverse=True)
+    label = f"{COUNTRY_FLAGS.get(picked, '🌍')} {picked} — Companies" if picked != "All countries" \
+        else "🌍 All Countries — Companies"
+    st.markdown(f"#### {label}" + (" (sorted by fit to your CV)" if has_cv else ""))
+
+    if not has_cv:
+        st.caption("Upload your CV in Profile to rank these by fit — showing them in scouted order for now.")
+
+    if not entries:
+        st.info("No scouted companies yet — go to **Companies** and click **Scout new roles**.")
         return
 
-    rows = []
-    for c in countries:
-        d = db["country_cache"].get(c, {})
-        fit_pct, fit_basis = compute_country_fit(c)
-        rows.append({
-            "Country": c,
-            "Fit %": f"{fit_pct}%" if fit_pct is not None else "—",
-            "Fit basis": fit_basis,
-            "Avg Salary (EUR)": f"€{d['salary_eur']:,}" if d.get("salary_eur") else "—",
-            "Avg Surplus (EUR)": f"€{d['surplus_eur']:,}" if d.get("surplus_eur") else "—",
-            "Last updated": d.get("updated_at", "never — click refresh"),
-            "_surplus_val": d.get("surplus_eur") or 0,
-        })
+    table_rows = [{
+        "Company": c.get("company_name") or extract_company_name(c["href"]),
+        "Stack": c.get("stack") or extract_tech_stack(c.get("title", ""), c.get("body", "")),
+        "Role": c.get("title", ""),
+        "Fit %": f"{c.get('fit', 0)}%" if has_cv else "—",
+        "Career Page": c["href"],
+    } for c in entries]
 
-    df = pd.DataFrame(rows)
-    sort_col = st.selectbox("Sort by", ["Fit %", "Avg Salary (EUR)", "Avg Surplus (EUR)"], index=2)
-    df_display = df.sort_values("_surplus_val", ascending=False) if sort_col == "Avg Surplus (EUR)" else df
-
-    c1, c2 = st.columns([1.3, 1])
-    with c1:
-        st.dataframe(df_display[["Country", "Fit %", "Fit basis", "Avg Salary (EUR)", "Avg Surplus (EUR)"]],
-                     use_container_width=True, hide_index=True)
-        cached_times = [db["country_cache"][c]["updated_at"] for c in countries if c in db["country_cache"]]
-        if cached_times:
-            st.markdown(f'<span class="last-updated">Oldest salary/cost-of-living data point: {min(cached_times)} '
-                        f'— AI-estimated from live web search, not a paid data feed.</span>', unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="last-updated">Fit % updates live as you scout roles. '
-                        'Salary/surplus need a market data refresh.</span>', unsafe_allow_html=True)
-    with c2:
-        fig = go.Figure(data=[go.Bar(
-            x=df["Country"], y=df["_surplus_val"], marker_color=ACCENT,
-            text=[f"€{v:,}" for v in df["_surplus_val"]], textposition="auto",
-        )])
-        fig.update_layout(template="plotly_dark", plot_bgcolor=CARD, paper_bgcolor=CARD,
-                           margin=dict(l=0, r=0, t=20, b=0), height=350, title="Annual surplus by country")
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.caption("Click a country below to jump into Companies filtered to it.")
-    cols = st.columns(min(len(countries), 5) or 1)
-    for i, c in enumerate(countries):
-        if cols[i % len(cols)].button(f"→ {c}", key=f"jump_{c}"):
-            st.session_state["companies_country_filter"] = c
-            st.session_state["nav"] = "Companies"
-            st.rerun()
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Career Page": st.column_config.LinkColumn("Career Page", display_text=None)},
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -409,6 +542,8 @@ def view_companies():
                         "body": h.get("body", ""),
                         "href": h["href"],
                         "country": h.get("_country", "Unknown"),
+                        "company_name": extract_company_name(h["href"]),
+                        "stack": extract_tech_stack(h.get("title", ""), h.get("body", "")),
                         "fit": fit,
                         "matched_skills": matched,
                         "liked": None,
@@ -531,8 +666,21 @@ def view_profile():
             prof["countries"] = st.multiselect("Target countries", DEFAULT_COUNTRIES, default=prof["countries"])
             prof["work_mode"] = st.selectbox("Work mode", ["Remote", "Hybrid", "Onsite"],
                                               index=["Remote", "Hybrid", "Onsite"].index(prof["work_mode"]))
-        with c2:
             prof["salary_floor"] = st.number_input("Minimum salary (EUR/yr)", value=prof["salary_floor"], step=1000)
+        with c2:
+            prof["nationality"] = st.text_input("Nationality (for visa estimates)", prof["nationality"])
+            prof["visa_status"] = st.selectbox(
+                "Visa situation", [
+                    "EU/EEA citizen (no visa needed)",
+                    "Non-EU — needs work visa/sponsorship",
+                    "Already hold a valid work permit",
+                ],
+                index=["EU/EEA citizen (no visa needed)", "Non-EU — needs work visa/sponsorship",
+                       "Already hold a valid work permit"].index(prof["visa_status"])
+                if prof["visa_status"] in ["EU/EEA citizen (no visa needed)", "Non-EU — needs work visa/sponsorship",
+                                            "Already hold a valid work permit"] else 0,
+            )
+            prof["languages"] = st.text_input("Languages you speak (comma separated)", prof["languages"])
             prof["lifestyle"] = st.text_input("Lifestyle assumption (for cost-of-living calc)", prof["lifestyle"])
             prof["avoid_industries"] = st.text_input("Industries to avoid (comma separated)", prof["avoid_industries"])
         if st.button("💾 Save preferences"):
