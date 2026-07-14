@@ -155,14 +155,20 @@ ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", 
 CAREER_SITE_FILTER = "(site:lever.co OR site:greenhouse.io OR site:ashbyhq.com OR site:workday.com OR site:jobs.smartrecruiters.com)"
 ALT_CAREER_SITE_FILTER = "(site:workable.com OR site:personio.de OR site:teamtailor.com OR site:jobvite.com OR site:breezy.hr OR site:recruitee.com)"
 
-# Aggregators/job boards to actively exclude — surfacing these instead of a company's own
-# career page was the single biggest complaint about the scouting engine.
-AGGREGATOR_DOMAINS = [
-    "indeed.com", "linkedin.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
+LINKEDIN_DOMAIN = "linkedin.com"
+LINKEDIN_FILTER = "site:linkedin.com/jobs"
+
+# General job-board aggregators — now a first-class scouted category of their own (its own
+# tab), not something to filter out. Kept separate from LinkedIn since that gets its own tab.
+JOB_BOARD_DOMAINS = [
+    "indeed.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
     "careerbuilder.com", "simplyhired.com", "jooble.org", "talent.com", "stepstone.",
     "totaljobs.com", "reed.co.uk", "cwjobs.co.uk", "adzuna.", "jobrapido.com",
     "jobisjob.", "careerjet.", "neuvoo.", "jobted.", "welcometothejungle.com",
 ]
+JOB_BOARD_FILTER = "(" + " OR ".join(f"site:{d.rstrip('.')}" for d in JOB_BOARD_DOMAINS[:9]) + ")"
+
+
 
 VISA_POSITIVE_PHRASES = [
     "visa sponsorship", "sponsor visa", "sponsors visas", "we sponsor", "relocation support",
@@ -429,9 +435,15 @@ def compute_apply_advice(c, profile, country_cache):
 # ============================================================================================
 # SCOUTING ENGINE
 # ============================================================================================
-def _is_aggregator(href):
+def determine_source(href):
+    """Classifies a posting into one of the three Companies sub-views. Checked from the URL
+    so it works even for legacy entries scouted before 'source' was stored explicitly."""
     href_low = (href or "").lower()
-    return any(dom in href_low for dom in AGGREGATOR_DOMAINS)
+    if LINKEDIN_DOMAIN in href_low:
+        return "linkedin"
+    if any(h in href_low for h in ATS_HOSTS):
+        return "career_page"
+    return "job_board"
 
 
 def _make_ddgs(timeout=8):
@@ -494,51 +506,40 @@ def _try_query_multi_backend(ddgs, query, max_results, backends=(None, "lite", "
     return [], last_err
 
 
-def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_SITE_FILTER, query_extra=""):
-    """Three-tier search per country, strictest to loosest — but every tier is skipped for
-    a country as soon as a connection-level error shows up, since retrying a broken network
-    path with a stricter or looser query is equally pointless. If two countries in a row
-    fail on connectivity, the whole run stops early with a clear message instead of grinding
-    through the remaining countries at the same doomed pace:
-      1. Narrow  — only the requested ATS host set (e.g. lever/greenhouse).
-      2. Medium  — BOTH known ATS host sets combined, still fully site-restricted.
-      3. Open (last resort) — no site restriction, with explicit '-site:' exclusions for
-         known aggregators; every result is still hard-filtered against AGGREGATOR_DOMAINS
-         afterward regardless of which tier found it.
-      4. One short backoff retry of the narrow query — only attempted if the failure so far
-         looked like 'no results'/rate-limit, not a dead connection."""
+def _run_country_loop(countries, query_builder, tiers_after_narrow=None, max_results=10):
+    """Shared per-country search loop: tries `query_builder(country)` for the narrow query,
+    then optionally each function in `tiers_after_narrow` (each taking country and returning
+    a query string) if the narrow query comes back empty for non-network reasons, then one
+    backoff retry of the narrow query. Aborts the whole run early after two consecutive
+    connection-level failures, since retrying more countries the same way is pointless."""
     results, errors = [], []
-    exclude_terms = " ".join(f"-site:{d.rstrip('.')}" for d in AGGREGATOR_DOMAINS)
     consecutive_network_failures = 0
 
     with _make_ddgs(8) as ddgs:
         for i, country in enumerate(countries):
             time.sleep(0.3)
 
-            narrow_query = f'{site_filter} "{role}" {country} {query_extra}'.strip()
-            hits, err = _try_query_multi_backend(ddgs, narrow_query, max_results_per_query)
+            narrow_query = query_builder(country)
+            hits, err = _try_query_multi_backend(ddgs, narrow_query, max_results)
             network_issue = _is_network_error(err)
 
-            if not hits and not network_issue:
-                combined_filter = f"({CAREER_SITE_FILTER.strip('()')} OR {ALT_CAREER_SITE_FILTER.strip('()')})"
-                medium_query = f'{combined_filter} "{role}" {country} {query_extra}'.strip()
-                hits, err2 = _try_query_multi_backend(ddgs, medium_query, max_results_per_query)
-                if not hits and err2:
-                    err = err2
-                    network_issue = _is_network_error(err2)
-
-            if not hits and not network_issue:
-                open_query = f"{role} jobs {country} careers {exclude_terms} {query_extra}".strip()
-                hits, err3 = _try_query_multi_backend(ddgs, open_query, max_results_per_query)
-                if not hits and err3:
-                    err = err3
-                    network_issue = _is_network_error(err3)
+            if not hits and not network_issue and tiers_after_narrow:
+                for build_fallback in tiers_after_narrow:
+                    fallback_query = build_fallback(country)
+                    hits, err_f = _try_query_multi_backend(ddgs, fallback_query, max_results)
+                    if hits:
+                        break
+                    if err_f:
+                        err = err_f
+                        network_issue = _is_network_error(err_f)
+                    if network_issue:
+                        break
 
             if not hits and not network_issue:
                 time.sleep(1.5)
-                hits, err4 = _try_query_multi_backend(ddgs, narrow_query, max_results_per_query)
-                if not hits and err4:
-                    err = err4
+                hits, err_retry = _try_query_multi_backend(ddgs, narrow_query, max_results)
+                if not hits and err_retry:
+                    err = err_retry
 
             if not hits and err:
                 errors.append(f"{country}: {err}")
@@ -546,7 +547,7 @@ def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_S
             if network_issue:
                 consecutive_network_failures += 1
                 if consecutive_network_failures >= 2:
-                    errors.append("Stopped early — DuckDuckGo connections are timing out from this network; "
+                    errors.append("Stopped early — connections are timing out from this network; "
                                   "the remaining countries would just repeat the same failure.")
                     break
             else:
@@ -559,12 +560,52 @@ def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_S
     seen, deduped = set(), []
     for r in results:
         href = r.get("href") or r.get("url")
-        if not href or href in seen or _is_aggregator(href):
+        if not href or href in seen:
             continue
         seen.add(href)
         r["href"] = href
         deduped.append(r)
     return deduped, errors
+
+
+def search_career_pages(role, countries, max_results_per_query=10, site_filter=CAREER_SITE_FILTER, query_extra=""):
+    """Career-pages tab: three-tier search, strictest to loosest —
+      1. Narrow  — only the requested ATS host set (e.g. lever/greenhouse).
+      2. Medium  — BOTH known ATS host sets combined, still fully site-restricted.
+      3. Open (last resort) — no site restriction, with explicit '-site:' exclusions for
+         LinkedIn and known job boards, so it doesn't just duplicate the other two tabs."""
+    exclude_terms = " ".join(f"-site:{d.rstrip('.')}" for d in ([LINKEDIN_DOMAIN] + JOB_BOARD_DOMAINS))
+
+    def narrow(country):
+        return f'{site_filter} "{role}" {country} {query_extra}'.strip()
+
+    def medium(country):
+        combined_filter = f"({CAREER_SITE_FILTER.strip('()')} OR {ALT_CAREER_SITE_FILTER.strip('()')})"
+        return f'{combined_filter} "{role}" {country} {query_extra}'.strip()
+
+    def open_tier(country):
+        return f"{role} jobs {country} careers {exclude_terms} {query_extra}".strip()
+
+    hits, errors = _run_country_loop(countries, narrow, [medium, open_tier], max_results=max_results_per_query)
+    hits = [h for h in hits if determine_source(h["href"]) == "career_page"]
+    return hits, errors
+
+
+def search_single_filter(role, countries, site_filter, max_results_per_query=10, query_extra=""):
+    """Used for the LinkedIn and Job Boards tabs — a single site-restricted query per
+    country (backend rotation + one backoff retry), no further fallback tiers, since the
+    whole point is staying within that specific source."""
+    def narrow(country):
+        return f'{site_filter} "{role}" {country} {query_extra}'.strip()
+    return _run_country_loop(countries, narrow, max_results=max_results_per_query)
+
+
+def search_linkedin(role, countries, max_results_per_query=10):
+    return search_single_filter(role, countries, LINKEDIN_FILTER, max_results_per_query)
+
+
+def search_job_boards(role, countries, max_results_per_query=10):
+    return search_single_filter(role, countries, JOB_BOARD_FILTER, max_results_per_query)
 
 
 def build_company_record(hit, cv_skills, fetch_full_page):
@@ -585,6 +626,7 @@ def build_company_record(hit, cv_skills, fetch_full_page):
         "body": body,
         "href": href,
         "country": hit.get("_country", "Unknown"),
+        "source": determine_source(href),
         "company_name": extract_company_name(href),
         "stack": extract_tech_stack(text_for_scoring, ""),
         "level": extract_level(title),
@@ -800,27 +842,127 @@ def view_dashboard():
         st.caption("Upload your CV in Profile to rank these by fit — showing them in scouted order for now.")
 
     if not entries:
-        st.info("No scouted companies yet — go to **Companies** and click **Scout new roles**.")
+        st.info("No scouted companies yet — go to **Companies** and click **Scout all three sources**.")
         return
 
+    source_short = {"linkedin": "🔗 LinkedIn", "career_page": "🏢 Career page", "job_board": "📋 Job board"}
     table_rows = [{
         "Company": c.get("company_name") or extract_company_name(c["href"]),
         "Country": c.get("country", "Unknown"),
+        "Source": source_short.get(c.get("source") or determine_source(c.get("href", "")), "—"),
         "Stack": c.get("stack") or extract_tech_stack(c.get("title", ""), c.get("body", "")),
         "Role": c.get("title", ""),
         "Fit %": f"{c.get('fit', 0)}%" if has_cv else "—",
-        "Career Page": c["href"],
+        "Link": c["href"],
     } for c in entries]
 
     st.dataframe(
         pd.DataFrame(table_rows), use_container_width=True, hide_index=True,
-        column_config={"Career Page": st.column_config.LinkColumn("Career Page", display_text=None)},
+        column_config={"Link": st.column_config.LinkColumn("Link", display_text=None)},
     )
 
 
 # ============================================================================================
 # VIEW 2 — COMPANIES
 # ============================================================================================
+SOURCE_LABELS = {
+    "linkedin": "🔗 LinkedIn Jobs",
+    "career_page": "🏢 Career Pages",
+    "job_board": "📋 Job Boards",
+}
+
+
+def _render_role_card(jid, c, prof):
+    pills = ''.join(f'<span class="pill">{s}</span>' for s in c.get('matched_skills', [])[:8])
+    body_preview = c['body'][:280] + ('...' if len(c['body']) > 280 else '')
+
+    level = c.get("level", "Not specified")
+    visa = c.get("visa_support", "Not specified")
+    visa_icon = {"Yes": "✅", "No": "❌", "Not specified": "❔"}.get(visa, "❔")
+
+    salary_mentioned = c.get("salary_mentioned")
+    country_est = db["country_cache"].get(c.get("country", ""), {}).get("salary_eur")
+    if salary_mentioned:
+        salary_line = f"💰 {salary_mentioned} <span class='small-muted'>(stated in posting)</span>"
+    elif country_est:
+        salary_line = (f"💰 ~€{country_est:,}/yr <span class='small-muted'>"
+                       f"(AI estimate — {c.get('country','this country')} average, not stated by employer)</span>")
+    else:
+        salary_line = "💰 <span class='small-muted'>Not stated — refresh market data for this country to get an estimate</span>"
+
+    advice_pct, advice_reasons = compute_apply_advice(c, prof, db["country_cache"])
+    advice_color = ACCENT if advice_pct >= 60 else ("#ffce54" if advice_pct >= 35 else "#8b909c")
+    advice_tooltip = "; ".join(advice_reasons) if advice_reasons else "based on fit alone"
+
+    card_html = (
+        '<div class="card">'
+        '<div style="display:flex; justify-content:space-between; align-items:center;">'
+        f'<h3 style="margin:0;">{c["title"]}</h3>'
+        f'<span class="fit-badge">{c.get("fit", 0)}% fit</span>'
+        '</div>'
+        f'<p class="small-muted">📍 {c["country"]} · 🏢 {c.get("company_name","")}</p>'
+        f'<div style="margin:8px 0;">'
+        f'<span class="pill">🎚 {level}</span>'
+        f'<span class="pill">{visa_icon} Visa: {visa}</span>'
+        f'<span class="pill" title="{advice_tooltip}" '
+        f'style="color:{advice_color}; border-color:{advice_color};">👉 Apply advice: {advice_pct}%</span>'
+        '</div>'
+        f'<p style="margin:6px 0;">{salary_line}</p>'
+        f'<p style="color:#c9cdd6; margin:10px 0;">{body_preview}</p>'
+        f'<div>{pills}</div>'
+        '</div>'
+    )
+    st.markdown(card_html, unsafe_allow_html=True)
+
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
+    if b1.button("👍 Like", key=f"like_{jid}"):
+        db["companies"][jid]["liked"] = True
+        save_db(db)
+        st.rerun()
+    if b2.button("👎 Dislike", key=f"dislike_{jid}"):
+        db["companies"][jid]["liked"] = False
+        save_db(db)
+        st.rerun()
+    b3.link_button("🚀 Open link", c["href"], use_container_width=True)
+
+    if not c.get("status"):
+        st.markdown('<span class="small-muted">After visiting the page, tell us what happened:</span>',
+                    unsafe_allow_html=True)
+        cc1, cc2 = st.columns(2)
+        if cc1.button("✅ I applied", key=f"applied_{jid}"):
+            db["companies"][jid]["status"] = "Applied"
+            db["companies"][jid]["logged_at"] = str(datetime.now())
+            save_db(db)
+            st.toast("Logged as Applied")
+            st.rerun()
+        if cc2.button("⏭️ Skipped", key=f"skipped_{jid}"):
+            db["companies"][jid]["status"] = "Skipped"
+            db["companies"][jid]["logged_at"] = str(datetime.now())
+            save_db(db)
+            st.toast("Logged as Skipped")
+            st.rerun()
+    else:
+        st.caption(f"Status: **{c['status']}** on {c['logged_at'][:16]}")
+
+    if b4.button("✨ Optimize CV", key=f"tailor_{jid}"):
+        if not db["tex_source"] and not db["cv_text"]:
+            st.error("Upload your CV in Profile first.")
+        else:
+            with st.spinner("Tailoring CV — grounded strictly in your source document..."):
+                tex, changes = optimize_cv_for_role(db["tex_source"], db["cv_text"], c["title"], c["body"])
+            st.session_state[f"tailored_{jid}"] = (tex, changes)
+
+    if f"tailored_{jid}" in st.session_state:
+        tex, changes = st.session_state[f"tailored_{jid}"]
+        with st.expander(f"Tailored CV for {c['title']}", expanded=True):
+            st.markdown("**What changed and why:**")
+            for ch in changes:
+                st.markdown(f"- {ch}")
+            st.download_button("⬇️ Download .tex", tex, file_name=f"cv_{jid}.tex", key=f"dl_{jid}")
+            st.code(tex[:3000] + ("..." if len(tex) > 3000 else ""), language="latex")
+            st.caption("Compile locally with pdflatex/Overleaf to get the PDF.")
+
+
 def view_companies():
     st.title("🏢 Companies & Roles")
     prof = db["profile"]
@@ -848,22 +990,29 @@ def view_companies():
                     continue
             return new_count
 
-        if st.button("🔭 Scout new roles", use_container_width=True):
+        if st.button("🔭 Scout all three sources", use_container_width=True):
             if not db["cv_skills"]:
                 st.warning("Upload & sync your CV in Profile first for real fit scoring.")
-            with st.spinner(f"Searching company career pages for {role}..."):
-                hits, errors = search_roles(role, countries, max_results_per_query=results_per_country)
-                new_count = _ingest(hits)
-                save_db(db)
-                if errors:
-                    st.warning(f"{len(errors)} search querie(s) failed (rate-limited or blocked): "
-                               + "; ".join(errors[:3]))
-                st.success(f"Found {len(hits)} candidate roles ({new_count} new).")
+            total_new, total_found = 0, 0
+            for label, fn in [
+                ("career pages", lambda: search_career_pages(role, countries, max_results_per_query=results_per_country)),
+                ("LinkedIn", lambda: search_linkedin(role, countries, max_results_per_query=results_per_country)),
+                ("job boards", lambda: search_job_boards(role, countries, max_results_per_query=results_per_country)),
+            ]:
+                with st.spinner(f"Searching {label} for {role}..."):
+                    hits, errors = fn()
+                    new_count = _ingest(hits)
+                    total_new += new_count
+                    total_found += len(hits)
+                    if errors:
+                        st.warning(f"{label}: {len(errors)} search querie(s) failed — " + "; ".join(errors[:3]))
+            save_db(db)
+            st.success(f"Found {total_found} candidate roles across all sources ({total_new} new).")
 
-        if st.button("🔁 Load more (different job boards)", use_container_width=True):
-            with st.spinner("Searching additional ATS platforms for more roles..."):
-                hits, errors = search_roles(role, countries, max_results_per_query=results_per_country,
-                                             site_filter=ALT_CAREER_SITE_FILTER)
+        if st.button("🔁 Load more career pages (alt ATS hosts)", use_container_width=True):
+            with st.spinner("Searching additional ATS platforms..."):
+                hits, errors = search_career_pages(role, countries, max_results_per_query=results_per_country,
+                                                    site_filter=ALT_CAREER_SITE_FILTER)
                 new_count = _ingest(hits)
                 save_db(db)
                 if errors:
@@ -888,6 +1037,7 @@ def view_companies():
                         c["visa_support"] = extract_visa_support(text_for_scoring)
                         c["salary_mentioned"] = extract_salary_mention(text_for_scoring)
                         c["company_name"] = c.get("company_name") or extract_company_name(c.get("href", ""))
+                        c["source"] = c.get("source") or determine_source(c.get("href", ""))
                         updated += 1
                     except Exception:
                         failed += 1
@@ -898,12 +1048,11 @@ def view_companies():
                     msg += f" Skipped {failed} that errored out."
                 st.success(msg)
 
-        if st.button("🧹 Remove aggregator-board entries", use_container_width=True):
-            before = len(db["companies"])
-            db["companies"] = {jid: c for jid, c in db["companies"].items() if not _is_aggregator(c.get("href", ""))}
-            removed = before - len(db["companies"])
+        if st.button("🧹 Clear all scouted entries", use_container_width=True):
+            db["companies"] = {}
             save_db(db)
-            st.success(f"Removed {removed} aggregator entr(y/ies) already in your list.")
+            st.success("Cleared. Your liked/disliked history and application log are gone with it — "
+                       "scout again to rebuild the list.")
 
         st.divider()
         country_options = ["All"] + sorted({c["country"] for c in db["companies"].values()})
@@ -918,114 +1067,36 @@ def view_companies():
         level_filter = st.multiselect("Level", LEVEL_OPTIONS, default=[], help=LEVEL_TOOLTIP)
         visa_filter = st.selectbox("Visa support mentioned", ["Any", "Yes", "No"])
 
-    entries = [(jid, c) for jid, c in db["companies"].items()]
-    if filter_country != "All":
-        entries = [(j, c) for j, c in entries if c["country"] == filter_country]
-    if liked_only:
-        entries = [(j, c) for j, c in entries if c.get("liked")]
-    if hide_decided:
-        entries = [(j, c) for j, c in entries if not c.get("status")]
-    if level_filter:
-        entries = [(j, c) for j, c in entries if c.get("level", "Not specified") in level_filter]
-    if visa_filter != "Any":
-        entries = [(j, c) for j, c in entries if c.get("visa_support") == visa_filter]
-    entries = [(j, c) for j, c in entries if c.get("fit", 0) >= min_fit]
-    entries.sort(key=lambda jc: jc[1].get("fit", 0), reverse=True)
+    def apply_shared_filters(entries):
+        if filter_country != "All":
+            entries = [(j, c) for j, c in entries if c["country"] == filter_country]
+        if liked_only:
+            entries = [(j, c) for j, c in entries if c.get("liked")]
+        if hide_decided:
+            entries = [(j, c) for j, c in entries if not c.get("status")]
+        if level_filter:
+            entries = [(j, c) for j, c in entries if c.get("level", "Not specified") in level_filter]
+        if visa_filter != "Any":
+            entries = [(j, c) for j, c in entries if c.get("visa_support") == visa_filter]
+        entries = [(j, c) for j, c in entries if c.get("fit", 0) >= min_fit]
+        entries.sort(key=lambda jc: jc[1].get("fit", 0), reverse=True)
+        return entries
 
-    if not entries:
-        st.info("No roles match these filters yet. Use **Scout new roles** in the sidebar.")
-        return
+    all_entries = [(jid, c) for jid, c in db["companies"].items()]
+    tab_order = ["linkedin", "career_page", "job_board"]
+    tabs = st.tabs([SOURCE_LABELS[s] for s in tab_order])
 
-    for jid, c in entries:
-        with st.container():
-            pills = ''.join(f'<span class="pill">{s}</span>' for s in c.get('matched_skills', [])[:8])
-            body_preview = c['body'][:280] + ('...' if len(c['body']) > 280 else '')
-
-            level = c.get("level", "Not specified")
-            visa = c.get("visa_support", "Not specified")
-            visa_icon = {"Yes": "✅", "No": "❌", "Not specified": "❔"}.get(visa, "❔")
-
-            salary_mentioned = c.get("salary_mentioned")
-            country_est = db["country_cache"].get(c.get("country", ""), {}).get("salary_eur")
-            if salary_mentioned:
-                salary_line = f"💰 {salary_mentioned} <span class='small-muted'>(stated in posting)</span>"
-            elif country_est:
-                salary_line = (f"💰 ~€{country_est:,}/yr <span class='small-muted'>"
-                               f"(AI estimate — {c.get('country','this country')} average, not stated by employer)</span>")
-            else:
-                salary_line = "💰 <span class='small-muted'>Not stated — refresh market data for this country to get an estimate</span>"
-
-            advice_pct, advice_reasons = compute_apply_advice(c, prof, db["country_cache"])
-            advice_color = ACCENT if advice_pct >= 60 else ("#ffce54" if advice_pct >= 35 else "#8b909c")
-            advice_tooltip = "; ".join(advice_reasons) if advice_reasons else "based on fit alone"
-
-            card_html = (
-                '<div class="card">'
-                '<div style="display:flex; justify-content:space-between; align-items:center;">'
-                f'<h3 style="margin:0;">{c["title"]}</h3>'
-                f'<span class="fit-badge">{c.get("fit", 0)}% fit</span>'
-                '</div>'
-                f'<p class="small-muted">📍 {c["country"]} · 🏢 {c.get("company_name","")}</p>'
-                f'<div style="margin:8px 0;">'
-                f'<span class="pill">🎚 {level}</span>'
-                f'<span class="pill">{visa_icon} Visa: {visa}</span>'
-                f'<span class="pill" title="{advice_tooltip}" '
-                f'style="color:{advice_color}; border-color:{advice_color};">👉 Apply advice: {advice_pct}%</span>'
-                '</div>'
-                f'<p style="margin:6px 0;">{salary_line}</p>'
-                f'<p style="color:#c9cdd6; margin:10px 0;">{body_preview}</p>'
-                f'<div>{pills}</div>'
-                '</div>'
-            )
-            st.markdown(card_html, unsafe_allow_html=True)
-
-            b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
-            if b1.button("👍 Like", key=f"like_{jid}"):
-                db["companies"][jid]["liked"] = True
-                save_db(db)
-                st.rerun()
-            if b2.button("👎 Dislike", key=f"dislike_{jid}"):
-                db["companies"][jid]["liked"] = False
-                save_db(db)
-                st.rerun()
-            b3.link_button("🚀 Open career page", c["href"], use_container_width=True)
-
-            if not c.get("status"):
-                st.markdown('<span class="small-muted">After visiting the page, tell us what happened:</span>',
-                            unsafe_allow_html=True)
-                cc1, cc2 = st.columns(2)
-                if cc1.button("✅ I applied", key=f"applied_{jid}"):
-                    db["companies"][jid]["status"] = "Applied"
-                    db["companies"][jid]["logged_at"] = str(datetime.now())
-                    save_db(db)
-                    st.toast("Logged as Applied")
-                    st.rerun()
-                if cc2.button("⏭️ Skipped", key=f"skipped_{jid}"):
-                    db["companies"][jid]["status"] = "Skipped"
-                    db["companies"][jid]["logged_at"] = str(datetime.now())
-                    save_db(db)
-                    st.toast("Logged as Skipped")
-                    st.rerun()
-            else:
-                st.caption(f"Status: **{c['status']}** on {c['logged_at'][:16]}")
-
-            if b4.button("✨ Optimize CV", key=f"tailor_{jid}"):
-                if not db["tex_source"] and not db["cv_text"]:
-                    st.error("Upload your CV in Profile first.")
-                else:
-                    with st.spinner("Tailoring CV — grounded strictly in your source document..."):
-                        tex, changes = optimize_cv_for_role(db["tex_source"], db["cv_text"], c["title"], c["body"])
-                    st.session_state[f"tailored_{jid}"] = (tex, changes)
-
-            if f"tailored_{jid}" in st.session_state:
-                tex, changes = st.session_state[f"tailored_{jid}"]
-                with st.expander(f"Tailored CV for {c['title']}", expanded=True):
-                    st.markdown("**What changed and why:**")
-                    for ch in changes:
-                        st.markdown(f"- {ch}")
-                    st.download_button("⬇️ Download .tex", tex, file_name=f"cv_{jid}.tex", key=f"dl_{jid}")
-                    st.code(tex[:3000] + ("..." if len(tex) > 3000 else ""), language="latex")
-                    st.caption("Compile locally with pdflatex/Overleaf to get the PDF.")
+    for source_key, tab in zip(tab_order, tabs):
+        with tab:
+            source_entries = [(j, c) for j, c in all_entries
+                               if (c.get("source") or determine_source(c.get("href", ""))) == source_key]
+            entries = apply_shared_filters(source_entries)
+            if not entries:
+                st.info("No roles here yet matching these filters. Use **Scout all three sources** in the sidebar.")
+                continue
+            for jid, c in entries:
+                with st.container():
+                    _render_role_card(jid, c, prof)
 
 
 # ============================================================================================
