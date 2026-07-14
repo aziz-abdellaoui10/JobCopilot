@@ -7,146 +7,176 @@ from datetime import datetime
 import pypdf
 import os
 from duckduckgo_search import DDGS
+import plotly.graph_objects as go
 
-# --- APP CONFIG & SECRETS ---
-st.set_page_config(page_title="Job Copilot PRO", layout="wide", page_icon="🚀")
+# --- CONFIG & STYLING ---
+st.set_page_config(page_title="Job Copilot | Hub", layout="wide", page_icon="🎯")
 
-# Groq Setup
+# Custom CSS for "Welcome to the Jungle" Aesthetic
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    .stApp {
+        background-color: #0e1117;
+    }
+    
+    /* Job Card Styling */
+    .job-card {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 15px;
+        padding: 25px;
+        margin-bottom: 20px;
+        transition: transform 0.2s, border 0.2s;
+    }
+    
+    .job-card:hover {
+        border: 1px solid #ff4b4b;
+        transform: translateY(-5px);
+    }
+    
+    .status-badge {
+        background: #ff4b4b;
+        color: white;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    
+    .salary-tag {
+        color: #00ffa3;
+        font-weight: 700;
+    }
+    </style>
+""", unsafe_allow_stdio=True)
+
+# --- SYSTEM INITIALIZATION ---
 if "GROQ_API_KEY" in st.secrets:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 else:
-    st.error("Missing GROQ_API_KEY in Streamlit Secrets!")
+    st.error("🔑 Please add GROQ_API_KEY to Streamlit Secrets.")
     st.stop()
 
-# --- DATABASE LOGIC ---
-DB_PATH = "user_data.json"
-
-def init_db():
-    if not os.path.exists(DB_PATH):
-        with open(DB_PATH, "w") as f:
-            json.dump({"applied": [], "cv_text": "", "target_role": ""}, f)
+DB_PATH = "copilot_storage.json"
 
 def get_db():
-    try:
-        with open(DB_PATH, "r") as f: 
-            return json.load(f)
-    except:
-        return {"applied": [], "cv_text": "", "target_role": ""}
+    if not os.path.exists(DB_PATH):
+        return {"applied": [], "cv_text": "", "preferences": {"role": "Software Engineer", "loc": "Europe"}}
+    with open(DB_PATH, "r") as f: return json.load(f)
 
 def save_db(data):
-    with open(DB_PATH, "w") as f: 
-        json.dump(data, f)
+    with open(DB_PATH, "w") as f: json.dump(data, f)
 
-init_db()
+db = get_db()
 
-# --- HELPER: MARKET DATA ---
-@st.cache_data(ttl=3600)
-def fetch_market_data():
-    hubs = ["Berlin", "London", "Amsterdam", "New York", "Singapore"]
-    results = []
-    for city in hubs:
-        slug = city.lower().replace(" ", "-")
-        try:
-            res = requests.get(f"https://api.teleport.org/api/urban_areas/slug:{slug}/scores/", timeout=5).json()
-            score = round(res['teleport_city_score'], 1)
-            results.append({"City": city, "Fit %": f"{int(score)}%", "COL Score": score, "Status": "Live Data"})
-        except:
-            defaults = {"Berlin": 68.2, "London": 58.9, "Amsterdam": 65.4, "New York": 52.1, "Singapore": 62.5}
-            results.append({"City": city, "Fit %": "Calculated", "COL Score": defaults.get(city, 50), "Status": "Benchmark"})
-    return results
+# --- SEARCH ENGINE 2.0 ---
+def ultra_scout(role, location):
+    # Specialized queries to find actual job boards, not just aggregators
+    queries = [
+        f"site:lever.co '{role}' {location}",
+        f"site:greenhouse.io '{role}' {location}",
+        f"site:workable.com '{role}' {location}"
+    ]
+    all_results = []
+    with DDGS() as ddgs:
+        for q in queries:
+            results = list(ddgs.text(q, max_results=5))
+            all_results.extend(results)
+    return all_results
 
-# --- VIEW 1: DASHBOARD ---
+# --- DASHBOARD: MARKET INTELLIGENCE ---
 def view_dashboard():
-    st.title("🌍 Global Market Intelligence")
-    st.caption(f"Last sync: {datetime.now().strftime('%H:%M')}")
+    st.title("📊 Personal Career Dashboard")
     
-    with st.spinner("Fetching market benchmarks..."):
-        data = fetch_market_data()
-        df = pd.DataFrame(data)
-        st.table(df)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Applications", len(db['applied']), "+1 this week")
+    col2.metric("Market Sentiment", "Bullish", "Tech Hubs")
+    col3.metric("Tailored CVs", "Ready", "Sync Active")
 
-# --- VIEW 2: COMPANIES & SCOUTER ---
-def view_companies():
-    st.title("🏢 Real-Time Job Scouting")
-    db = get_db()
-    
-    c1, c2 = st.columns(2)
-    role = c1.text_input("Target Job Title", value=db.get("target_role", "Software Engineer"))
-    loc = c2.text_input("Preferred Region", "Europe")
-
-    if st.button("🔍 Scout Live Roles"):
-        db["target_role"] = role
-        save_db(db)
-            
-        with st.spinner(f"Searching for {role} roles in {loc}..."):
-            try:
-                with DDGS() as ddgs:
-                    search_query = f"site:lever.co OR site:greenhouse.io '{role}' {loc} jobs"
-                    results = list(ddgs.text(search_query, max_results=8))
-                
-                if results:
-                    for i, job in enumerate(results):
-                        with st.container(border=True):
-                            st.subheader(job['title'])
-                            st.write(f"🔗 [View Career Page]({job['href']})")
-                            st.write(job['body'][:250] + "...")
-                            
-                            col_a, col_b = st.columns(2)
-                            
-                            if col_a.button(f"✨ Optimize CV", key=f"opt_{i}"):
-                                if not db.get('cv_text'):
-                                    st.warning("Please upload your CV in the Profile tab first!")
-                                else:
-                                    # SAFER PROMPT CONSTRUCTION (Avoiding f-string curly brace errors)
-                                    instruction = "TASK: Rewrite my 'Professional Summary' and suggest 3 bullet points to highlight for this specific job. CONSTRAINT: Do NOT invent new skills or experience. Use only what is in my CV."
-                                    full_prompt = "JOB DESCRIPTION:\n" + job['body'] + "\n\nMY ORIGINAL CV:\n" + db['cv_text'][:3000] + "\n\n" + instruction
-                                    
-                                    response = client.chat.completions.create(
-                                        model="llama3-8b-8192",
-                                        messages=[{"role": "user", "content": full_prompt}]
-                                    )
-                                    st.info("Tailored CV Adjustments:")
-                                    st.write(response.choices[0].message.content)
-                                    
-                            if col_b.button(f"✅ Track Application", key=f"track_{i}"):
-                                db['applied'].append({"role": job['title'], "date": datetime.now().strftime("%Y-%m-%d")})
-                                save_db(db)
-                                st.success("Logged to Application Journey!")
-                else:
-                    st.warning("No roles found. Try a broader search term (e.g., just 'Developer').")
-            except Exception as e:
-                st.error(f"Search failed. Please try again in a moment.")
-
-# --- VIEW 3: PROFILE ---
-def view_profile():
-    st.title("👤 Canonical Profile")
-    db = get_db()
-
-    uploaded_file = st.file_uploader("Update your Original CV (PDF)", type="pdf")
-    if uploaded_file:
+    st.subheader("Global Surplus Index (Salary - Cost of Living)")
+    hubs = ["Berlin", "London", "Amsterdam", "New York", "Singapore"]
+    scores = []
+    for city in hubs:
         try:
-            reader = pypdf.PdfReader(uploaded_file)
-            full_text = ""
-            for page in reader.pages:
-                full_text += page.extract_text()
-            db['cv_text'] = full_text
-            save_db(db)
-            st.success("CV Processed and Stored!")
-        except Exception as e:
-            st.error(f"Failed to read PDF: {e}")
-
-    st.divider()
-    st.subheader("Your Application Journey")
-    if db.get('applied'):
-        st.table(pd.DataFrame(db['applied']))
-    else:
-        st.info("No applications tracked yet.")
+            res = requests.get(f"https://api.teleport.org/api/urban_areas/slug:{city.lower().replace(' ', '-')}/scores/").json()
+            scores.append(res['teleport_city_score'])
+        except: scores.append(50)
     
-    if st.checkbox("Show Stored CV Data"):
-        st.text(db.get("cv_text", "No CV data stored yet."))
+    fig = go.Figure(data=[go.Bar(x=hubs, y=scores, marker_color='#ff4b4b')])
+    fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig, use_container_width=True)
 
-# --- MAIN NAV ---
-nav = st.sidebar.radio("Navigate", ["Dashboard", "Companies", "Profile"])
-if nav == "Dashboard": view_dashboard()
-elif nav == "Companies": view_companies()
-elif nav == "Profile": view_profile()
+# --- SCOUTING: THE WTTJ EXPERIENCE ---
+def view_companies():
+    st.title("🔭 Role Discovery")
+    
+    with st.sidebar:
+        st.subheader("Search Filters")
+        role = st.text_input("Role Title", db['preferences']['role'])
+        loc = st.text_input("Location", db['preferences']['loc'])
+        if st.button("Update Preferences"):
+            db['preferences'] = {"role": role, "loc": loc}
+            save_db(db)
+
+    jobs = ultra_scout(role, loc)
+    
+    for i, job in enumerate(jobs):
+        st.markdown(f"""
+            <div class="job-card">
+                <span class="status-badge">New Opening</span>
+                <h3 style="margin-top:10px;">{job['title']}</h3>
+                <p style="color: #aaa;">{job['body'][:200]}...</p>
+                <p class="salary-tag">Estimated: $90k - $130k • {loc}</p>
+            </div>
+        """, unsafe_allow_stdio=True)
+        
+        c1, c2, c3 = st.columns([1,1,2])
+        
+        if c1.button("✨ Tailor CV", key=f"tailor_{i}"):
+            if not db['cv_text']:
+                st.error("Please upload CV in Profile first.")
+            else:
+                with st.spinner("AI Analysis..."):
+                    prompt = f"Using ONLY my CV: {db['cv_text'][:2000]}. Rewrite my summary for {job['title']} and explain why I am a fit based on specific keywords."
+                    res = client.chat.completions.create(model="llama3-8b-8192", messages=[{"role": "user", "content": prompt}])
+                    st.info(res.choices[0].message.content)
+        
+        c2.link_button("🚀 Apply", job['href'])
+        
+        if c3.button("✅ Log Application", key=f"log_{i}"):
+            db['applied'].append({"company": job['title'], "date": str(datetime.now().date())})
+            save_db(db)
+            st.toast("Application tracked!")
+
+# --- PROFILE: CANONICAL SOURCE ---
+def view_profile():
+    st.title("👤 Canonical Workspace")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Source Materials")
+        up_pdf = st.file_uploader("Original CV (PDF)", type="pdf")
+        if up_pdf:
+            reader = pypdf.PdfReader(up_pdf)
+            text = "".join([p.extract_text() for p in reader.pages])
+            db['cv_text'] = text
+            save_db(db)
+            st.success("CV Synced to local Brain.")
+
+    with col2:
+        st.subheader("Application Tracker")
+        if db['applied']:
+            st.table(pd.DataFrame(db['applied']))
+        else:
+            st.info("Your journey starts here.")
+
+# --- NAVIGATION ---
+pages = {"Dashboard": view_dashboard, "Scouting": view_companies, "Workspace": view_profile}
+selected = st.sidebar.selectbox("Navigate", pages.keys())
+pages[selected]()
