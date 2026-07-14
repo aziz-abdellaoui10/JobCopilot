@@ -2,6 +2,5 @@ streamlit
 groq
 pypdf
 pandas
-requests
-duckduckgo-search
 plotly
+ddgs
