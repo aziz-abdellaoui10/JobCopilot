@@ -434,6 +434,29 @@ def _is_aggregator(href):
     return any(dom in href_low for dom in AGGREGATOR_DOMAINS)
 
 
+def _make_ddgs(timeout=8):
+    """A few older ddgs/duckduckgo_search versions don't accept a timeout kwarg — fall back
+    to the no-arg constructor rather than crashing the whole scouting run over it."""
+    try:
+        return DDGS(timeout=timeout)
+    except TypeError:
+        return DDGS()
+
+
+def _is_network_error(err):
+    """Distinguishes 'DuckDuckGo couldn't be reached at all' from 'query genuinely returned
+    nothing'. The former means retrying a different backend or a different query phrasing
+    won't help — the connection itself is failing (common on cloud/shared IPs with
+    restrictive egress) — so we should fail fast instead of burning time on repeats."""
+    if not err:
+        return False
+    e = err.lower()
+    return any(k in e for k in [
+        "timeout", "timed out", "connect", "connection", "max retries",
+        "failed to establish", "name resolution", "network is unreachable",
+    ])
+
+
 def _try_query(ddgs, query, max_results, backend=None):
     try:
         kwargs = {"max_results": max_results}
@@ -453,11 +476,11 @@ def _try_query(ddgs, query, max_results, backend=None):
 
 
 def _try_query_multi_backend(ddgs, query, max_results, backends=(None, "lite", "html")):
-    """Try the same query across a few backends before giving up. DuckDuckGo's 'auto' mode
-    (the default) picks a backend at random per call, and on shared/cloud IPs (e.g. Streamlit
-    Community Cloud) some backends are effectively blocked while others still work — so a
-    single attempt can fail consistently even though the query itself is fine. Rotating
-    backends recovers a lot of these without needing a proxy."""
+    """Try the same query across a few backends before giving up — but only when it might
+    plausibly help. If the first attempt fails with a connection-level error, the network
+    path itself is broken and trying a different backend endpoint over the same broken
+    connection won't fix it, so we stop immediately instead of tripling the wait for
+    nothing."""
     last_err = None
     for backend in backends:
         hits, err = _try_query(ddgs, query, max_results, backend=backend)
@@ -465,52 +488,70 @@ def _try_query_multi_backend(ddgs, query, max_results, backends=(None, "lite", "
             return hits, None
         if err:
             last_err = err
-            time.sleep(0.5)
+            if _is_network_error(err):
+                break
+            time.sleep(0.4)
     return [], last_err
 
 
 def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_SITE_FILTER, query_extra=""):
-    """Three-tier search per country, strictest to loosest, each tier rotating across a
-    couple of DuckDuckGo backends before moving on:
+    """Three-tier search per country, strictest to loosest — but every tier is skipped for
+    a country as soon as a connection-level error shows up, since retrying a broken network
+    path with a stricter or looser query is equally pointless. If two countries in a row
+    fail on connectivity, the whole run stops early with a clear message instead of grinding
+    through the remaining countries at the same doomed pace:
       1. Narrow  — only the requested ATS host set (e.g. lever/greenhouse).
       2. Medium  — BOTH known ATS host sets combined, still fully site-restricted.
-      3. Open (last resort) — no site restriction, but with explicit '-site:' exclusions
-         for known aggregators, plus every result is hard-filtered against
-         AGGREGATOR_DOMAINS afterward regardless of which tier found it.
-    If a country still comes up empty after all three tiers, one final backoff retry is
-    made on the narrow query after a longer pause, since 'no results' from a shared IP is
-    often a transient rate-limit rather than a genuine empty result set."""
+      3. Open (last resort) — no site restriction, with explicit '-site:' exclusions for
+         known aggregators; every result is still hard-filtered against AGGREGATOR_DOMAINS
+         afterward regardless of which tier found it.
+      4. One short backoff retry of the narrow query — only attempted if the failure so far
+         looked like 'no results'/rate-limit, not a dead connection."""
     results, errors = [], []
     exclude_terms = " ".join(f"-site:{d.rstrip('.')}" for d in AGGREGATOR_DOMAINS)
+    consecutive_network_failures = 0
 
-    with DDGS() as ddgs:
+    with _make_ddgs(8) as ddgs:
         for i, country in enumerate(countries):
-            time.sleep(0.5 + 0.2 * (i % 3))
+            time.sleep(0.3)
 
             narrow_query = f'{site_filter} "{role}" {country} {query_extra}'.strip()
             hits, err = _try_query_multi_backend(ddgs, narrow_query, max_results_per_query)
+            network_issue = _is_network_error(err)
 
-            if not hits:
+            if not hits and not network_issue:
                 combined_filter = f"({CAREER_SITE_FILTER.strip('()')} OR {ALT_CAREER_SITE_FILTER.strip('()')})"
                 medium_query = f'{combined_filter} "{role}" {country} {query_extra}'.strip()
                 hits, err2 = _try_query_multi_backend(ddgs, medium_query, max_results_per_query)
                 if not hits and err2:
                     err = err2
+                    network_issue = _is_network_error(err2)
 
-            if not hits:
+            if not hits and not network_issue:
                 open_query = f"{role} jobs {country} careers {exclude_terms} {query_extra}".strip()
                 hits, err3 = _try_query_multi_backend(ddgs, open_query, max_results_per_query)
                 if not hits and err3:
                     err = err3
+                    network_issue = _is_network_error(err3)
 
-            if not hits:
-                time.sleep(3.0)  # longer backoff — 'no results' is often a transient block, not truly empty
+            if not hits and not network_issue:
+                time.sleep(1.5)
                 hits, err4 = _try_query_multi_backend(ddgs, narrow_query, max_results_per_query)
                 if not hits and err4:
                     err = err4
 
             if not hits and err:
                 errors.append(f"{country}: {err}")
+
+            if network_issue:
+                consecutive_network_failures += 1
+                if consecutive_network_failures >= 2:
+                    errors.append("Stopped early — DuckDuckGo connections are timing out from this network; "
+                                  "the remaining countries would just repeat the same failure.")
+                    break
+            else:
+                consecutive_network_failures = 0
+
             for h in hits:
                 h["_country"] = country
             results.extend(hits)
@@ -563,7 +604,7 @@ def build_company_record(hit, cv_skills, fetch_full_page):
 def refresh_country_data(countries, role, seniority):
     client = get_client()
     prof = db["profile"]
-    with DDGS() as ddgs:
+    with _make_ddgs(8) as ddgs:
         for country in countries:
             try:
                 snippets = list(ddgs.text(
