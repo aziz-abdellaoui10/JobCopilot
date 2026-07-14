@@ -220,6 +220,104 @@ def extract_tech_stack(title, body):
     return ", ".join(found[:5]) if found else "—"
 
 
+LEVEL_DEFINITIONS = {
+    "Internship": "Student/intern position, usually part of a degree program.",
+    "Junior": "Roughly 0-2 years experience; entry-level or graduate roles.",
+    "Mid": "Roughly 2-5 years experience; works independently on well-scoped work.",
+    "Senior": "Roughly 5+ years experience; owns projects end-to-end, mentors others.",
+    "Staff/Lead": "Senior IC or team-lead scope; sets technical direction across a team.",
+    "Not specified": "Seniority wasn't detectable from the posting title.",
+}
+LEVEL_TOOLTIP = "\n".join(f"{k}: {v}" for k, v in LEVEL_DEFINITIONS.items())
+
+
+def extract_level(title):
+    """Level is read from the title only (not the body) — body text often name-drops
+    unrelated seniority words ('work with senior engineers') that would misclassify a
+    posting if scanned too broadly."""
+    t = (title or "").lower()
+    if any(k in t for k in ["intern", "internship"]):
+        return "Internship"
+    if any(k in t for k in ["staff", "principal", "head of", "lead "]) or t.strip().endswith("lead"):
+        return "Staff/Lead"
+    if any(k in t for k in ["senior", "sr.", "sr "]):
+        return "Senior"
+    if any(k in t for k in ["junior", "jr.", "jr ", "entry level", "entry-level", "graduate"]):
+        return "Junior"
+    if any(k in t for k in ["mid-level", "mid level", "intermediate"]):
+        return "Mid"
+    return "Not specified"
+
+
+VISA_POSITIVE_PHRASES = [
+    "visa sponsorship", "sponsor visa", "sponsors visas", "we sponsor", "relocation support",
+    "relocation assistance", "work permit assistance", "visa support", "sponsorship available",
+    "will sponsor",
+]
+VISA_NEGATIVE_PHRASES = [
+    "no visa sponsorship", "not able to sponsor", "unable to sponsor", "cannot sponsor",
+    "no sponsorship", "must have the right to work", "must already have the right to work",
+    "without sponsorship",
+]
+
+
+def extract_visa_support(text):
+    t = (text or "").lower()
+    if any(p in t for p in VISA_NEGATIVE_PHRASES):
+        return "No"
+    if any(p in t for p in VISA_POSITIVE_PHRASES):
+        return "Yes"
+    return "Not specified"
+
+
+SALARY_MENTION_REGEX = re.compile(
+    r'(?:€|\$|£)\s?\d{1,3}(?:[.,]\d{3})*\s?[kK]?(?:\s?(?:-|–|to)\s?(?:€|\$|£)?\s?\d{1,3}(?:[.,]\d{3})*\s?[kK]?)?'
+)
+
+
+def extract_salary_mention(text):
+    """Only returns a value if the job posting/page itself states a figure — we never want
+    to present an AI estimate as if the employer said it. Returns None if nothing found."""
+    if not text:
+        return None
+    match = SALARY_MENTION_REGEX.search(text)
+    return match.group(0).strip() if match else None
+
+
+def compute_apply_advice(c, profile, country_cache):
+    """A separate 'should you apply' score from raw fit — factors in things fit alone
+    doesn't capture: whether you'd actually need visa sponsorship here and whether this
+    role offers it, and whether the salary (if known) clears your floor."""
+    score = c.get("fit", 0)
+    reasons = []
+
+    needs_visa = profile.get("visa_status") != "EU/EEA citizen (no visa needed)"
+    if needs_visa:
+        if c.get("visa_support") == "Yes":
+            score += 15
+            reasons.append("mentions visa sponsorship")
+        elif c.get("visa_support") == "No":
+            score -= 25
+            reasons.append("says no visa sponsorship")
+
+    salary_mentioned = extract_salary_mention(c.get("title", "") + " " + c.get("body", ""))
+    salary_floor = profile.get("salary_floor")
+    country_est = country_cache.get(c.get("country", ""), {}).get("salary_eur")
+    if not salary_mentioned and country_est and salary_floor:
+        if country_est >= salary_floor:
+            score += 5
+            reasons.append("country avg salary clears your floor")
+        else:
+            score -= 10
+            reasons.append("country avg salary is below your floor")
+
+    if c.get("liked") is False:
+        score -= 30
+        reasons.append("you disliked this one")
+
+    return max(0, min(100, round(score))), reasons
+
+
 def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
     """Best-effort fetch of a job posting's page text, for stack detection and fit scoring.
     Search snippets are often just a title restated ('Jobs at JetBrains') with no real content,
@@ -615,6 +713,9 @@ def view_companies():
                         "country": h.get("_country", "Unknown"),
                         "company_name": extract_company_name(href),
                         "stack": extract_tech_stack(text_for_scoring, ""),
+                        "level": extract_level(h.get("title", "")),
+                        "visa_support": extract_visa_support(text_for_scoring),
+                        "salary_mentioned": extract_salary_mention(text_for_scoring),
                         "fit": fit,
                         "matched_skills": matched,
                         "liked": None,
@@ -662,6 +763,9 @@ def view_companies():
                         c["fit"] = fit
                         c["matched_skills"] = matched
                         c["stack"] = extract_tech_stack(text_for_scoring, "")
+                        c["level"] = extract_level(c.get("title", ""))
+                        c["visa_support"] = extract_visa_support(text_for_scoring)
+                        c["salary_mentioned"] = extract_salary_mention(text_for_scoring)
                         c["company_name"] = c.get("company_name") or extract_company_name(c.get("href", ""))
                         updated += 1
                     except Exception:
@@ -684,6 +788,11 @@ def view_companies():
         min_fit = st.slider("Minimum fit %", 0, 100, 0)
         liked_only = st.checkbox("Liked only")
         hide_decided = st.checkbox("Hide applied/skipped", value=True)
+        level_filter = st.multiselect(
+            "Level", ["Internship", "Junior", "Mid", "Senior", "Staff/Lead", "Not specified"],
+            default=[], help=LEVEL_TOOLTIP,
+        )
+        visa_filter = st.selectbox("Visa support mentioned", ["Any", "Yes", "No"])
 
     entries = [(jid, c) for jid, c in db["companies"].items()]
     if filter_country != "All":
@@ -692,6 +801,10 @@ def view_companies():
         entries = [(j, c) for j, c in entries if c.get("liked")]
     if hide_decided:
         entries = [(j, c) for j, c in entries if not c.get("status")]
+    if level_filter:
+        entries = [(j, c) for j, c in entries if c.get("level", "Not specified") in level_filter]
+    if visa_filter != "Any":
+        entries = [(j, c) for j, c in entries if c.get("visa_support") == visa_filter]
     entries = [(j, c) for j, c in entries if c.get("fit", 0) >= min_fit]
     entries.sort(key=lambda jc: jc[1].get("fit", 0), reverse=True)
 
@@ -703,6 +816,25 @@ def view_companies():
         with st.container():
             pills = ''.join(f'<span class="pill">{s}</span>' for s in c.get('matched_skills', [])[:8])
             body_preview = c['body'][:280] + ('...' if len(c['body']) > 280 else '')
+
+            level = c.get("level", "Not specified")
+            visa = c.get("visa_support", "Not specified")
+            visa_icon = {"Yes": "✅", "No": "❌", "Not specified": "❔"}.get(visa, "❔")
+
+            salary_mentioned = c.get("salary_mentioned")
+            country_est = db["country_cache"].get(c.get("country", ""), {}).get("salary_eur")
+            if salary_mentioned:
+                salary_line = f"💰 {salary_mentioned} <span class='small-muted'>(stated in posting)</span>"
+            elif country_est:
+                salary_line = (f"💰 ~€{country_est:,}/yr <span class='small-muted'>"
+                               f"(AI estimate — {c.get('country','this country')} average, not stated by employer)</span>")
+            else:
+                salary_line = "💰 <span class='small-muted'>Not stated — refresh market data for this country to get an estimate</span>"
+
+            advice_pct, advice_reasons = compute_apply_advice(c, prof, db["country_cache"])
+            advice_color = ACCENT if advice_pct >= 60 else ("#ffce54" if advice_pct >= 35 else "#8b909c")
+            advice_tooltip = "; ".join(advice_reasons) if advice_reasons else "based on fit alone"
+
             card_html = (
                 '<div class="card">'
                 '<div style="display:flex; justify-content:space-between; align-items:center;">'
@@ -710,6 +842,13 @@ def view_companies():
                 f'<span class="fit-badge">{c.get("fit", 0)}% fit</span>'
                 '</div>'
                 f'<p class="small-muted">📍 {c["country"]}</p>'
+                f'<div style="margin:8px 0;">'
+                f'<span class="pill">🎚 {level}</span>'
+                f'<span class="pill">{visa_icon} Visa: {visa}</span>'
+                f'<span class="pill" title="{advice_tooltip}" '
+                f'style="color:{advice_color}; border-color:{advice_color};">👉 Apply advice: {advice_pct}%</span>'
+                '</div>'
+                f'<p style="margin:6px 0;">{salary_line}</p>'
                 f'<p style="color:#c9cdd6; margin:10px 0;">{body_preview}</p>'
                 f'<div>{pills}</div>'
                 '</div>'
