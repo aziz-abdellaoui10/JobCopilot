@@ -4,3 +4,4 @@ pypdf
 pandas
 requests
 pylatexenc
+duckduckgo-search
