@@ -434,22 +434,52 @@ def _is_aggregator(href):
     return any(dom in href_low for dom in AGGREGATOR_DOMAINS)
 
 
-def _try_query(ddgs, query, max_results):
+def _try_query(ddgs, query, max_results, backend=None):
     try:
-        hits = list(ddgs.text(query, max_results=max_results))
+        kwargs = {"max_results": max_results}
+        if backend:
+            kwargs["backend"] = backend
+        hits = list(ddgs.text(query, **kwargs))
         return hits, None
+    except TypeError:
+        # installed ddgs version doesn't support the backend kwarg — retry without it
+        try:
+            hits = list(ddgs.text(query, max_results=max_results))
+            return hits, None
+        except Exception as e:
+            return [], str(e)
     except Exception as e:
         return [], str(e)
 
 
+def _try_query_multi_backend(ddgs, query, max_results, backends=(None, "lite", "html")):
+    """Try the same query across a few backends before giving up. DuckDuckGo's 'auto' mode
+    (the default) picks a backend at random per call, and on shared/cloud IPs (e.g. Streamlit
+    Community Cloud) some backends are effectively blocked while others still work — so a
+    single attempt can fail consistently even though the query itself is fine. Rotating
+    backends recovers a lot of these without needing a proxy."""
+    last_err = None
+    for backend in backends:
+        hits, err = _try_query(ddgs, query, max_results, backend=backend)
+        if hits:
+            return hits, None
+        if err:
+            last_err = err
+            time.sleep(0.5)
+    return [], last_err
+
+
 def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_SITE_FILTER, query_extra=""):
-    """Three-tier search per country, strictest to loosest:
+    """Three-tier search per country, strictest to loosest, each tier rotating across a
+    couple of DuckDuckGo backends before moving on:
       1. Narrow  — only the requested ATS host set (e.g. lever/greenhouse).
       2. Medium  — BOTH known ATS host sets combined, still fully site-restricted.
       3. Open (last resort) — no site restriction, but with explicit '-site:' exclusions
          for known aggregators, plus every result is hard-filtered against
          AGGREGATOR_DOMAINS afterward regardless of which tier found it.
-    A jittered delay between countries reduces rate-limit hits."""
+    If a country still comes up empty after all three tiers, one final backoff retry is
+    made on the narrow query after a longer pause, since 'no results' from a shared IP is
+    often a transient rate-limit rather than a genuine empty result set."""
     results, errors = [], []
     exclude_terms = " ".join(f"-site:{d.rstrip('.')}" for d in AGGREGATOR_DOMAINS)
 
@@ -458,22 +488,26 @@ def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_S
             time.sleep(0.5 + 0.2 * (i % 3))
 
             narrow_query = f'{site_filter} "{role}" {country} {query_extra}'.strip()
-            hits, err = _try_query(ddgs, narrow_query, max_results_per_query)
+            hits, err = _try_query_multi_backend(ddgs, narrow_query, max_results_per_query)
 
             if not hits:
-                time.sleep(0.6)
                 combined_filter = f"({CAREER_SITE_FILTER.strip('()')} OR {ALT_CAREER_SITE_FILTER.strip('()')})"
                 medium_query = f'{combined_filter} "{role}" {country} {query_extra}'.strip()
-                hits, err2 = _try_query(ddgs, medium_query, max_results_per_query)
+                hits, err2 = _try_query_multi_backend(ddgs, medium_query, max_results_per_query)
                 if not hits and err2:
                     err = err2
 
             if not hits:
-                time.sleep(0.6)
                 open_query = f"{role} jobs {country} careers {exclude_terms} {query_extra}".strip()
-                hits, err3 = _try_query(ddgs, open_query, max_results_per_query)
+                hits, err3 = _try_query_multi_backend(ddgs, open_query, max_results_per_query)
                 if not hits and err3:
                     err = err3
+
+            if not hits:
+                time.sleep(3.0)  # longer backoff — 'no results' is often a transient block, not truly empty
+                hits, err4 = _try_query_multi_backend(ddgs, narrow_query, max_results_per_query)
+                if not hits and err4:
+                    err = err4
 
             if not hits and err:
                 errors.append(f"{country}: {err}")
