@@ -425,7 +425,13 @@ def view_dashboard():
             refresh_country_data(countries, prof["role"], prof["seniority"])
         st.rerun()
 
-    cached = [c for c in countries if c in db["country_cache"]]
+    cached = [c for c in countries
+              if c in db["country_cache"] and "qol_stars" in db["country_cache"][c]]
+    stale = [c for c in countries
+             if c in db["country_cache"] and "qol_stars" not in db["country_cache"][c]]
+    if stale:
+        st.warning(f"{len(stale)} countr(y/ies) have data cached from before the ranking table was added "
+                   f"({', '.join(stale)}) — click **Refresh market & visa data** to re-estimate them.")
     if not cached:
         st.info("No ranking data yet — click **Refresh market & visa data** above to generate it "
                 "(estimates are personalized to your visa situation and languages in Profile).")
