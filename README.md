@@ -37,24 +37,28 @@ iterated on.
   picker.
 
 **Companies**
-- Scouting searches real company career pages (Lever, Greenhouse, Ashby, Workday,
+- Three sub-tabs: **🔗 LinkedIn Jobs**, **🏢 Career Pages**, **📋 Job Boards** (Indeed, Glassdoor,
+  Monster, ZipRecruiter, StepStone, TotalJobs, Reed, Adzuna, etc.) — one click ("Scout all
+  three sources") searches all three categories and each posting lands in the tab matching
+  where it actually came from.
+- Career Pages still uses the strict career-page engine (Lever, Greenhouse, Ashby, Workday,
   SmartRecruiters, Workable, Personio, Teamtailor, JobVite, Breezy, Recruitee) via a
-  three-tier query (narrow → combined ATS → open-with-exclusions), with aggregators
-  (Indeed, LinkedIn, Glassdoor, etc.) hard-filtered out of every result regardless of tier.
-- "Load more (different job boards)" pulls from the alternate ATS set instead of repeating
-  the same search. "Recompute stack & fit" re-scores everything already scouted with
-  current logic. "Remove aggregator-board entries" cleans out anything that slipped in
-  from an earlier version.
-- Filters: country, minimum fit %, liked-only, hide applied/skipped, level (with a tooltip
-  defining each level), visa-support mentioned.
+  three-tier query (narrow → combined ATS → open-with-exclusions), explicitly excluding
+  LinkedIn/job-board domains so it doesn't just duplicate the other two tabs.
+- "Load more career pages (alt ATS hosts)" pulls from the alternate ATS set. "Recompute
+  stack & fit" re-scores everything already scouted with current logic. "Clear all scouted
+  entries" wipes the list for a clean restart (also clears your liked/applied history, so
+  it's a deliberate reset, not routine cleanup).
+- Filters (country, minimum fit %, liked-only, hide applied/skipped, level, visa-support)
+  apply within whichever tab you're viewing.
 - Per-role card: transparent fit % (keyword overlap against your parsed CV skills, shown
   as matched-skill pills), level, visa-support indicator, a separate "apply advice" %
   (fit adjusted for visa fit and salary-floor fit, with a hover tooltip explaining why),
   and a salary line that only shows a JD-stated figure as "stated in posting" — otherwise
   it falls back to a clearly-labeled AI country-average estimate, or says outright that
   nothing's available.
-- Apply flow: opening the career page immediately surfaces an "Applied / Skipped" prompt
-  that logs a timestamp; already-decided roles get filtered out of future views.
+- Apply flow: opening the link immediately surfaces an "Applied / Skipped" prompt that
+  logs a timestamp; already-decided roles get filtered out of future views.
 - Optimize CV: LaTeX tailoring restricted to reordering/rewording existing content —
   never invents skills, titles, dates, or employers — with a "what changed and why" list
   next to the downloadable `.tex`.
