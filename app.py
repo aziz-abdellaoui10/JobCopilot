@@ -177,23 +177,41 @@ def score_job_fit(job_text, cv_skills):
 CAREER_SITE_FILTER = "(site:lever.co OR site:greenhouse.io OR site:ashbyhq.com OR site:workday.com OR site:jobs.smartrecruiters.com)"
 
 
-def search_roles(role, countries, max_results_per_query=8):
-    results, errors = [], []
+def _try_query(ddgs, query, max_results):
+    """Run one query, returning (hits, error_message_or_None)."""
     try:
-        with DDGS() as ddgs:
-            for country in countries:
-                query = f'{CAREER_SITE_FILTER} "{role}" {country}'
-                try:
-                    hits = list(ddgs.text(query, max_results=max_results_per_query))
-                except Exception as e:
-                    errors.append(f"{country}: {e}")
-                    hits = []
-                for h in hits:
-                    h["_country"] = country
-                results.extend(hits)
-                time.sleep(0.4)  # be polite to the backend, reduce rate-limit risk
+        hits = list(ddgs.text(query, max_results=max_results))
+        return hits, None
     except Exception as e:
-        errors.append(str(e))
+        return [], str(e)
+
+
+def search_roles(role, countries, max_results_per_query=8):
+    """Search each country with a narrow (site-restricted) query first; if that comes back
+    empty, retry once with a broader query before giving up on that country. Most of the
+    'No results found' failures came from the narrow query genuinely being too strict for
+    that country/backend combo, not purely rate limiting — so a fallback query recovers a
+    lot of them. A jittered delay between countries also reduces rate-limit hits."""
+    results, errors = [], []
+    with DDGS() as ddgs:
+        for i, country in enumerate(countries):
+            time.sleep(0.5 + 0.2 * (i % 3))
+
+            narrow_query = f'{CAREER_SITE_FILTER} "{role}" {country}'
+            hits, err = _try_query(ddgs, narrow_query, max_results_per_query)
+
+            if not hits:
+                time.sleep(0.6)
+                broad_query = f"{role} jobs {country} careers"
+                hits, err2 = _try_query(ddgs, broad_query, max_results_per_query)
+                if not hits and err2:
+                    err = err2
+
+            if not hits and err:
+                errors.append(f"{country}: {err}")
+            for h in hits:
+                h["_country"] = country
+            results.extend(hits)
 
     # dedupe by href
     seen, deduped = set(), []
@@ -244,17 +262,10 @@ def refresh_country_data(countries, role, seniority):
             except Exception as e:
                 salary, col, note = 0, 0, f"estimation failed: {e}"
 
-            # fit % = share of currently-cached matched roles in this country vs total cached roles
-            country_roles = [c for c in db["companies"].values() if c.get("country") == country]
-            fit_scores = [c["fit"] for c in country_roles if "fit" in c]
-            fit_pct = round(sum(fit_scores) / len(fit_scores)) if fit_scores else None
-
             db["country_cache"][country] = {
                 "salary_eur": salary,
                 "col_eur": col,
                 "surplus_eur": (salary - col) if salary and col else None,
-                "fit_pct": fit_pct,
-                "fit_basis": f"{len(country_roles)} scouted roles" if country_roles else "no roles scouted yet",
                 "note": note,
                 "updated_at": datetime.now().isoformat(timespec="minutes"),
             }
@@ -294,6 +305,16 @@ def optimize_cv_for_role(tex_source, cv_text, job_title, job_body):
         return raw, ["(model did not return structured JSON — showing raw output)"]
 
 
+def compute_country_fit(country):
+    """Live fit % for a country — always reflects whatever has been scouted so far,
+    not a snapshot frozen at the last time salary/col data was refreshed."""
+    country_roles = [c for c in db["companies"].values() if c.get("country") == country]
+    scores = [c["fit"] for c in country_roles if "fit" in c]
+    if not scores:
+        return None, "no roles scouted yet"
+    return round(sum(scores) / len(scores)), f"{len(scores)} scouted role(s)"
+
+
 # --------------------------------------------------------------------------------------
 # VIEW 1 — DASHBOARD
 # --------------------------------------------------------------------------------------
@@ -310,27 +331,23 @@ def view_dashboard():
                 refresh_country_data(countries, prof["role"], prof["seniority"])
             st.rerun()
 
-    if not db["country_cache"]:
-        st.info("No market data yet — click **Refresh market data** to pull current estimates.")
+    if not db["companies"] and not db["country_cache"]:
+        st.info("No data yet — scout some roles in **Companies** and/or click **Refresh market data** here.")
         return
 
     rows = []
     for c in countries:
-        d = db["country_cache"].get(c)
-        if not d:
-            continue
+        d = db["country_cache"].get(c, {})
+        fit_pct, fit_basis = compute_country_fit(c)
         rows.append({
             "Country": c,
-            "Fit %": f"{d['fit_pct']}%" if d.get("fit_pct") is not None else "—",
+            "Fit %": f"{fit_pct}%" if fit_pct is not None else "—",
+            "Fit basis": fit_basis,
             "Avg Salary (EUR)": f"€{d['salary_eur']:,}" if d.get("salary_eur") else "—",
             "Avg Surplus (EUR)": f"€{d['surplus_eur']:,}" if d.get("surplus_eur") else "—",
-            "Last updated": d["updated_at"],
+            "Last updated": d.get("updated_at", "never — click refresh"),
             "_surplus_val": d.get("surplus_eur") or 0,
         })
-
-    if not rows:
-        st.info("Selected countries have no cached data yet — hit refresh.")
-        return
 
     df = pd.DataFrame(rows)
     sort_col = st.selectbox("Sort by", ["Fit %", "Avg Salary (EUR)", "Avg Surplus (EUR)"], index=2)
@@ -338,11 +355,15 @@ def view_dashboard():
 
     c1, c2 = st.columns([1.3, 1])
     with c1:
-        st.dataframe(df_display[["Country", "Fit %", "Avg Salary (EUR)", "Avg Surplus (EUR)"]],
+        st.dataframe(df_display[["Country", "Fit %", "Fit basis", "Avg Salary (EUR)", "Avg Surplus (EUR)"]],
                      use_container_width=True, hide_index=True)
-        oldest = min(db["country_cache"][c]["updated_at"] for c in countries if c in db["country_cache"])
-        st.markdown(f'<span class="last-updated">Oldest data point: {oldest} — AI-estimated from live web search, not a paid data feed.</span>',
-                    unsafe_allow_html=True)
+        cached_times = [db["country_cache"][c]["updated_at"] for c in countries if c in db["country_cache"]]
+        if cached_times:
+            st.markdown(f'<span class="last-updated">Oldest salary/cost-of-living data point: {min(cached_times)} '
+                        f'— AI-estimated from live web search, not a paid data feed.</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="last-updated">Fit % updates live as you scout roles. '
+                        'Salary/surplus need a market data refresh.</span>', unsafe_allow_html=True)
     with c2:
         fig = go.Figure(data=[go.Bar(
             x=df["Country"], y=df["_surplus_val"], marker_color=ACCENT,
