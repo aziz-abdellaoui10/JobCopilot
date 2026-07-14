@@ -2,16 +2,20 @@
 Personal Job Copilot — private, local-use Streamlit app.
 
 Views:
-  1. Dashboard  — country fit / salary / cost-of-living surplus overview
-  2. Companies  — browse & filter matched roles, like/dislike, apply+track, tailor CV
-  3. Profile    — preferences, master CV files, liked/disliked list, application tracker
+  1. Dashboard  — personalized country ranking (surplus, visa speed, QoL, remote culture,
+                  "your edge") + a companies table sorted by fit once your CV is synced
+  2. Companies  — scout roles from real company career pages, filter by level/visa/fit,
+                  like/dislike, log applied/skipped, get an "apply advice" score, and
+                  generate a strictly-truthful tailored CV variant per role
+  3. Profile    — preferences (incl. visa situation, languages), master CV files,
+                  liked/disliked list, application tracker with stats
 
 Run locally with:
     streamlit run app.py
 
-Requires a `.streamlit/secrets.toml` file with:
+Requires a `.streamlit/secrets.toml` file next to this script:
     GROQ_API_KEY = "your-key-here"
-(Never paste your real key into chat or commit it to a repo — rotate it if you ever do.)
+Never paste a real key into a chat or commit it — rotate it if you ever do.
 """
 
 import streamlit as st
@@ -20,7 +24,8 @@ import os
 import re
 import hashlib
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
+from urllib.parse import urlparse
 
 import pandas as pd
 import pypdf
@@ -28,14 +33,13 @@ import requests
 from groq import Groq
 
 try:
-    from ddgs import DDGS  # current package name
+    from ddgs import DDGS  # current package name (formerly duckduckgo_search)
 except ImportError:
-    # fallback for older environments that still only have the deprecated package
-    from duckduckgo_search import DDGS  # noqa: F401
+    from duckduckgo_search import DDGS  # noqa: F401 — fallback for older envs
 
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # CONFIG & THEME  ("Welcome to the Jungle"-inspired: dark canvas, warm accent, bold type)
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 st.set_page_config(page_title="Job Copilot", layout="wide", page_icon="🐆")
 
 ACCENT = "#FF6B4A"
@@ -60,7 +64,7 @@ h1, h2, h3 {{ font-weight: 800 !important; letter-spacing: -0.02em; }}
 }}
 .pill {{
     display:inline-block; background:#232730; color:{ACCENT_SOFT}; font-size:12px;
-    padding:2px 10px; border-radius:12px; margin-right:6px; border:1px solid {BORDER};
+    padding:2px 10px; border-radius:12px; margin-right:6px; margin-bottom:4px; border:1px solid {BORDER};
 }}
 .small-muted {{ color:#8b909c; font-size:13px; }}
 .stButton>button {{ border-radius:10px; border:1px solid {BORDER}; }}
@@ -69,7 +73,11 @@ h1, h2, h3 {{ font-weight: 800 !important; letter-spacing: -0.02em; }}
 </style>
 """, unsafe_allow_html=True)
 
+# ============================================================================================
+# CONSTANTS
+# ============================================================================================
 DB_PATH = "copilot_db.json"
+
 DEFAULT_COUNTRIES = ["Germany", "Netherlands", "United Kingdom", "Belgium", "France",
                      "Switzerland", "Ireland", "Spain", "Portugal", "Poland", "Czech Republic",
                      "Sweden", "Denmark", "Austria", "Italy", "Canada", "United States"]
@@ -110,18 +118,79 @@ DEFAULT_DB = {
     "tex_source": "",
     "cv_skills": [],
     "cv_meta_updated": None,
-    "companies": {},        # id -> role/company record incl. liked/status/date
-    "country_cache": {},    # country -> ranking/market data, see refresh_country_data
+    "companies": {},        # id -> role/company record (see _ingest for schema)
+    "country_cache": {},    # country -> ranking/market data (see refresh_country_data)
 }
 
+VISA_STATUS_OPTIONS = [
+    "EU/EEA citizen (no visa needed)",
+    "Non-EU — needs work visa/sponsorship",
+    "Already hold a valid work permit",
+]
 
+LEVEL_DEFINITIONS = {
+    "Internship": "Student/intern position, usually part of a degree program.",
+    "Junior": "Roughly 0-2 years experience; entry-level or graduate roles.",
+    "Mid": "Roughly 2-5 years experience; works independently on well-scoped work.",
+    "Senior": "Roughly 5+ years experience; owns projects end-to-end, mentors others.",
+    "Staff/Lead": "Senior IC or team-lead scope; sets technical direction across a team.",
+    "Not specified": "Seniority wasn't detectable from the posting title.",
+}
+LEVEL_TOOLTIP = "\n".join(f"{k}: {v}" for k, v in LEVEL_DEFINITIONS.items())
+LEVEL_OPTIONS = list(LEVEL_DEFINITIONS.keys())
+
+TECH_VOCAB = [
+    "Python", "JavaScript", "TypeScript", "Java", "Go", "Golang", "Rust", "Ruby", "PHP", "Scala",
+    "Kotlin", "Swift", "C++", "C#", ".NET", "Node.js", "React", "Vue", "Angular", "Next.js",
+    "Django", "Flask", "FastAPI", "Spring", "Rails", "AWS", "GCP", "Azure", "Docker", "Kubernetes",
+    "Terraform", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Kafka", "GraphQL", "REST",
+    "Machine Learning", "TensorFlow", "PyTorch",
+]
+
+# ATS/first-party hosts we treat as genuine company career pages
+ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "myworkdayjobs.com",
+             "workday.com", "workable.com", "personio.de", "teamtailor.com", "jobvite.com",
+             "breezy.hr", "recruitee.com")
+
+CAREER_SITE_FILTER = "(site:lever.co OR site:greenhouse.io OR site:ashbyhq.com OR site:workday.com OR site:jobs.smartrecruiters.com)"
+ALT_CAREER_SITE_FILTER = "(site:workable.com OR site:personio.de OR site:teamtailor.com OR site:jobvite.com OR site:breezy.hr OR site:recruitee.com)"
+
+# Aggregators/job boards to actively exclude — surfacing these instead of a company's own
+# career page was the single biggest complaint about the scouting engine.
+AGGREGATOR_DOMAINS = [
+    "indeed.com", "linkedin.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
+    "careerbuilder.com", "simplyhired.com", "jooble.org", "talent.com", "stepstone.",
+    "totaljobs.com", "reed.co.uk", "cwjobs.co.uk", "adzuna.", "jobrapido.com",
+    "jobisjob.", "careerjet.", "neuvoo.", "jobted.", "welcometothejungle.com",
+]
+
+VISA_POSITIVE_PHRASES = [
+    "visa sponsorship", "sponsor visa", "sponsors visas", "we sponsor", "relocation support",
+    "relocation assistance", "work permit assistance", "visa support", "sponsorship available",
+    "will sponsor",
+]
+VISA_NEGATIVE_PHRASES = [
+    "no visa sponsorship", "not able to sponsor", "unable to sponsor", "cannot sponsor",
+    "no sponsorship", "must have the right to work", "must already have the right to work",
+    "without sponsorship",
+]
+
+SALARY_MENTION_REGEX = re.compile(
+    r'(?:€|\$|£)\s?\d{1,3}(?:[.,]\d{3})*\s?[kK]?(?:\s?(?:-|–|to)\s?(?:€|\$|£)?\s?\d{1,3}(?:[.,]\d{3})*\s?[kK]?)?'
+)
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+# ============================================================================================
+# PERSISTENCE
+# ============================================================================================
 def load_db():
     if not os.path.exists(DB_PATH):
         return json.loads(json.dumps(DEFAULT_DB))
     try:
         with open(DB_PATH, "r") as f:
             data = json.load(f)
-        # backfill any missing top-level and nested profile keys as the schema grows
         for k, v in DEFAULT_DB.items():
             data.setdefault(k, v)
         for k, v in DEFAULT_DB["profile"].items():
@@ -141,6 +210,9 @@ if "db" not in st.session_state:
 db = st.session_state.db
 
 
+# ============================================================================================
+# SHARED UI HELPERS
+# ============================================================================================
 def country_picker(label, key, default):
     """Country multiselect with a 'quick add region' control next to it, so picking
     'Europe' or 'North America' adds every country in that region in one click instead
@@ -176,12 +248,21 @@ def job_id(href, title):
     return hashlib.sha1(f"{href}|{title}".encode()).hexdigest()[:12]
 
 
-# --------------------------------------------------------------------------------------
-# CV PARSING — turn PDF/LaTeX into a canonical skills profile (grounds later generation)
-# --------------------------------------------------------------------------------------
+def _stars(n):
+    n = max(0, min(5, int(n)))
+    return "★" * n + "☆" * (5 - n)
+
+
+def _json_from_response(raw):
+    """Strip a ```json fence if the model added one, then parse."""
+    cleaned = re.sub(r"^```json|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    return json.loads(cleaned)
+
+
+# ============================================================================================
+# CV PARSING — canonical skills profile, grounds all later scoring/generation
+# ============================================================================================
 def extract_cv_skills(cv_text, tex_source):
-    """Ask the model to extract a flat skills/keyword list strictly from the CV content.
-    This list is later used for transparent, explainable fit scoring — no invented skills."""
     client = get_client()
     source = (cv_text or "") + "\n" + (tex_source or "")
     prompt = (
@@ -191,13 +272,9 @@ def extract_cv_skills(cv_text, tex_source):
     )
     try:
         res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
+            model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0,
         )
-        raw = res.choices[0].message.content.strip()
-        raw = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
-        skills = json.loads(raw)
+        skills = _json_from_response(res.choices[0].message.content)
         return [s.strip() for s in skills if isinstance(s, str) and s.strip()]
     except Exception as e:
         st.warning(f"Skill extraction failed ({e}); falling back to naive keyword scan.")
@@ -205,41 +282,29 @@ def extract_cv_skills(cv_text, tex_source):
         return list(dict.fromkeys(words))[:80]
 
 
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # EXPLAINABLE FIT SCORING — no black box: score = keyword overlap, matches shown to user
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 def score_job_fit(job_text, cv_skills):
-    """Transparent fit score: percentage based on how many of the candidate's known skills show
-    up in the posting, scaled against a fixed 'strong match' threshold rather than the size of
-    the candidate's whole skill list — dividing by the full CV skill count (as before) punished
-    anyone with a long CV, since a short job snippet will never mention most of a 60-skill list."""
+    """Scaled against a fixed 'strong match' threshold rather than the size of the whole CV
+    skill list — dividing by total skill count punishes anyone with a long CV, since a job
+    posting will never mention most of a 60-skill list even for a perfect-fit role."""
     if not cv_skills:
         return 0, []
     text_low = job_text.lower()
     matched = [s for s in cv_skills if s.lower() in text_low]
-    STRONG_MATCH_COUNT = 5  # 5+ matched skills counts as a full/100% fit
+    STRONG_MATCH_COUNT = 5  # 5+ matched skills = a full/100% fit
     score = min(100, round(100 * len(matched) / STRONG_MATCH_COUNT))
     return score, matched
 
 
-ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "myworkdayjobs.com",
-             "workday.com", "workable.com", "personio.de", "teamtailor.com", "jobvite.com",
-             "breezy.hr", "recruitee.com")
-
-TECH_VOCAB = [
-    "Python", "JavaScript", "TypeScript", "Java", "Go", "Golang", "Rust", "Ruby", "PHP", "Scala",
-    "Kotlin", "Swift", "C++", "C#", ".NET", "Node.js", "React", "Vue", "Angular", "Next.js",
-    "Django", "Flask", "FastAPI", "Spring", "Rails", "AWS", "GCP", "Azure", "Docker", "Kubernetes",
-    "Terraform", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "Kafka", "GraphQL", "REST",
-    "Machine Learning", "TensorFlow", "PyTorch",
-]
-
-
+# ============================================================================================
+# POSTING ENRICHMENT — company name, tech stack, level, visa support, stated salary
+# ============================================================================================
 def extract_company_name(href):
     """Prefer the real company name over the ATS/aggregator domain when the link is hosted
     on a third-party applicant-tracking system."""
     try:
-        from urllib.parse import urlparse
         parsed = urlparse(href)
         netloc = parsed.netloc.replace("www.", "")
         if any(h in netloc for h in ATS_HOSTS):
@@ -257,21 +322,10 @@ def extract_tech_stack(title, body):
     return ", ".join(found[:5]) if found else "—"
 
 
-LEVEL_DEFINITIONS = {
-    "Internship": "Student/intern position, usually part of a degree program.",
-    "Junior": "Roughly 0-2 years experience; entry-level or graduate roles.",
-    "Mid": "Roughly 2-5 years experience; works independently on well-scoped work.",
-    "Senior": "Roughly 5+ years experience; owns projects end-to-end, mentors others.",
-    "Staff/Lead": "Senior IC or team-lead scope; sets technical direction across a team.",
-    "Not specified": "Seniority wasn't detectable from the posting title.",
-}
-LEVEL_TOOLTIP = "\n".join(f"{k}: {v}" for k, v in LEVEL_DEFINITIONS.items())
-
-
 def extract_level(title):
-    """Level is read from the title only (not the body) — body text often name-drops
-    unrelated seniority words ('work with senior engineers') that would misclassify a
-    posting if scanned too broadly."""
+    """Level is read from the title only — body text often name-drops unrelated seniority
+    words ('work with senior engineers') that would misclassify a posting if scanned too
+    broadly."""
     t = (title or "").lower()
     if any(k in t for k in ["intern", "internship"]):
         return "Internship"
@@ -286,18 +340,6 @@ def extract_level(title):
     return "Not specified"
 
 
-VISA_POSITIVE_PHRASES = [
-    "visa sponsorship", "sponsor visa", "sponsors visas", "we sponsor", "relocation support",
-    "relocation assistance", "work permit assistance", "visa support", "sponsorship available",
-    "will sponsor",
-]
-VISA_NEGATIVE_PHRASES = [
-    "no visa sponsorship", "not able to sponsor", "unable to sponsor", "cannot sponsor",
-    "no sponsorship", "must have the right to work", "must already have the right to work",
-    "without sponsorship",
-]
-
-
 def extract_visa_support(text):
     t = (text or "").lower()
     if any(p in t for p in VISA_NEGATIVE_PHRASES):
@@ -307,24 +349,53 @@ def extract_visa_support(text):
     return "Not specified"
 
 
-SALARY_MENTION_REGEX = re.compile(
-    r'(?:€|\$|£)\s?\d{1,3}(?:[.,]\d{3})*\s?[kK]?(?:\s?(?:-|–|to)\s?(?:€|\$|£)?\s?\d{1,3}(?:[.,]\d{3})*\s?[kK]?)?'
-)
-
-
 def extract_salary_mention(text):
-    """Only returns a value if the job posting/page itself states a figure — we never want
-    to present an AI estimate as if the employer said it. Returns None if nothing found."""
+    """Only returns a value if the posting itself states a figure — never presented as if
+    the employer said it when it's actually our own estimate."""
     if not text:
         return None
     match = SALARY_MENTION_REGEX.search(text)
     return match.group(0).strip() if match else None
 
 
+def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
+    """Best-effort fetch of a job posting's real page text. Search snippets are often just
+    a restated title with no real content, so scoring against the snippet alone badly
+    under-detects stack/level/visa/fit. Fails silently on network errors, non-http links,
+    or JS-only pages. Downloads are capped so one huge/slow page can't stall the run or
+    blow up memory on a small hosting instance."""
+    if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+        return ""
+    try:
+        resp = requests.get(
+            url, timeout=timeout, stream=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; JobCopilot/1.0; personal use)"},
+        )
+        if resp.status_code != 200:
+            return ""
+        chunks, total = [], 0
+        for chunk in resp.iter_content(chunk_size=8192, decode_unicode=False):
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_download_bytes:
+                break
+        raw = b"".join(chunks)
+        html = raw.decode(resp.encoding or "utf-8", errors="ignore")[:max_download_bytes]
+        html = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ",
+                      html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
 def compute_apply_advice(c, profile, country_cache):
-    """A separate 'should you apply' score from raw fit — factors in things fit alone
-    doesn't capture: whether you'd actually need visa sponsorship here and whether this
-    role offers it, and whether the salary (if known) clears your floor."""
+    """Separate from raw fit — factors in things fit alone doesn't capture: whether you'd
+    need visa sponsorship here and whether this role offers it, and whether the (known)
+    salary clears your floor."""
     score = c.get("fit", 0)
     reasons = []
 
@@ -355,66 +426,15 @@ def compute_apply_advice(c, profile, country_cache):
     return max(0, min(100, round(score))), reasons
 
 
-def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
-    """Best-effort fetch of a job posting's page text, for stack detection and fit scoring.
-    Search snippets are often just a title restated ('Jobs at JetBrains') with no real content,
-    so scoring against the snippet alone badly under-detects both tech stack and fit. Fails
-    silently (returns '') on network errors, blocks, non-http links, or JS-only pages — callers
-    fall back to the snippet in that case. Downloads are capped so one huge or slow page can't
-    stall or blow up memory on a small hosting instance."""
-    if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
-        return ""
-    try:
-        resp = requests.get(
-            url, timeout=timeout, stream=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; JobCopilot/1.0; personal use)"},
-        )
-        if resp.status_code != 200:
-            return ""
-        chunks, total = [], 0
-        for chunk in resp.iter_content(chunk_size=8192, decode_unicode=False):
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= max_download_bytes:
-                break
-        raw = b"".join(chunks)
-        html = raw.decode(resp.encoding or "utf-8", errors="ignore")
-        html = html[:max_download_bytes]  # extra safety before regex work
-        html = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ",
-                      html, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text[:max_chars]
-    except Exception:
-        return ""
-
-
-# --------------------------------------------------------------------------------------
-# SCOUTING ENGINE — searches company career pages, prefers first-party links over boards
-# --------------------------------------------------------------------------------------
-CAREER_SITE_FILTER = "(site:lever.co OR site:greenhouse.io OR site:ashbyhq.com OR site:workday.com OR site:jobs.smartrecruiters.com)"
-ALT_CAREER_SITE_FILTER = "(site:workable.com OR site:personio.de OR site:teamtailor.com OR site:jobvite.com OR site:breezy.hr OR site:recruitee.com)"
-
-# Aggregators/job boards to actively keep out — these kept slipping through the old
-# unrestricted fallback query, which is what caused most results to be board listings
-# instead of a company's own career page.
-AGGREGATOR_DOMAINS = [
-    "indeed.com", "linkedin.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
-    "careerbuilder.com", "simplyhired.com", "jooble.org", "talent.com", "stepstone.",
-    "totaljobs.com", "reed.co.uk", "cwjobs.co.uk", "adzuna.", "jobrapido.com",
-    "jobisjob.", "careerjet.", "neuvoo.", "jobted.", "welcometothejungle.com",
-]
-
-
+# ============================================================================================
+# SCOUTING ENGINE
+# ============================================================================================
 def _is_aggregator(href):
     href_low = (href or "").lower()
     return any(dom in href_low for dom in AGGREGATOR_DOMAINS)
 
 
 def _try_query(ddgs, query, max_results):
-    """Run one query, returning (hits, error_message_or_None)."""
     try:
         hits = list(ddgs.text(query, max_results=max_results))
         return hits, None
@@ -422,17 +442,14 @@ def _try_query(ddgs, query, max_results):
         return [], str(e)
 
 
-def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SITE_FILTER, query_extra=""):
-    """Three-tier search per country, from strictest to loosest:
-      1. Narrow: only the requested ATS host set (e.g. lever/greenhouse).
-      2. Medium: BOTH known ATS host sets combined — recovers a lot of the empty-result
-         cases without giving up the site restriction entirely.
-      3. Open, as a last resort: no site restriction, but explicitly excludes the known
-         job-board aggregators via '-site:' terms, and results are still hard-filtered
-         against AGGREGATOR_DOMAINS afterward as a safety net.
-    This replaced a version whose fallback query had no site restriction at all, which is
-    why most results were coming from Indeed/LinkedIn/Glassdoor instead of a company's own
-    career page."""
+def search_roles(role, countries, max_results_per_query=10, site_filter=CAREER_SITE_FILTER, query_extra=""):
+    """Three-tier search per country, strictest to loosest:
+      1. Narrow  — only the requested ATS host set (e.g. lever/greenhouse).
+      2. Medium  — BOTH known ATS host sets combined, still fully site-restricted.
+      3. Open (last resort) — no site restriction, but with explicit '-site:' exclusions
+         for known aggregators, plus every result is hard-filtered against
+         AGGREGATOR_DOMAINS afterward regardless of which tier found it.
+    A jittered delay between countries reduces rate-limit hits."""
     results, errors = [], []
     exclude_terms = " ".join(f"-site:{d.rstrip('.')}" for d in AGGREGATOR_DOMAINS)
 
@@ -464,7 +481,6 @@ def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SI
                 h["_country"] = country
             results.extend(hits)
 
-    # dedupe by href, and hard-filter out any aggregator that slipped through
     seen, deduped = set(), []
     for r in results:
         href = r.get("href") or r.get("url")
@@ -476,9 +492,40 @@ def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SI
     return deduped, errors
 
 
-# --------------------------------------------------------------------------------------
-# MARKET INTELLIGENCE — AI-synthesized from live search snippets, always timestamped
-# --------------------------------------------------------------------------------------
+def build_company_record(hit, cv_skills, fetch_full_page):
+    """Turn a raw search hit into a full company/role record: enrich with real page text
+    when possible, then score fit and detect stack/level/visa/salary from that richer text."""
+    href = hit.get("href")
+    title = hit.get("title", "Untitled role")
+    body = hit.get("body", "")
+    text_for_scoring = f"{title} {body}"
+    if fetch_full_page:
+        page_text = fetch_page_text(href)
+        if page_text:
+            text_for_scoring += " " + page_text
+
+    fit, matched = score_job_fit(text_for_scoring, cv_skills)
+    return {
+        "title": title,
+        "body": body,
+        "href": href,
+        "country": hit.get("_country", "Unknown"),
+        "company_name": extract_company_name(href),
+        "stack": extract_tech_stack(text_for_scoring, ""),
+        "level": extract_level(title),
+        "visa_support": extract_visa_support(text_for_scoring),
+        "salary_mentioned": extract_salary_mention(text_for_scoring),
+        "fit": fit,
+        "matched_skills": matched,
+        "liked": None,
+        "status": None,
+        "logged_at": None,
+    }
+
+
+# ============================================================================================
+# MARKET INTELLIGENCE — AI-synthesized, personalized, always timestamped
+# ============================================================================================
 def refresh_country_data(countries, role, seniority):
     client = get_client()
     prof = db["profile"]
@@ -500,19 +547,16 @@ def refresh_country_data(countries, role, seniority):
                 f"Using the web search snippets below (and general knowledge if snippets are thin), estimate:\n"
                 f"- salary_eur: average gross ANNUAL salary in EUR for this role/level in {country}\n"
                 f"- col_eur: average ANNUAL cost of living in EUR for the stated lifestyle\n"
-                f"- monthly_surplus_low / monthly_surplus_high: a realistic MONTHLY surplus range in EUR "
-                f"(salary minus cost of living, divided by 12, with some realistic spread)\n"
-                f"- visa_speed_weeks: a short string like '2-4 weeks' reflecting how fast THIS candidate "
-                f"(given their stated nationality/visa situation) could realistically get authorized to work there. "
-                f"If they're already an EU/EEA citizen and the country is in the EU/EEA, speed should reflect that "
-                f"no visa is needed at all — say so explicitly.\n"
-                f"- visa_favorability: 'green' (fast/no visa needed), 'yellow' (moderate/some friction), or "
-                f"'red' (slow or restrictive) — from THIS candidate's perspective specifically\n"
+                f"- monthly_surplus_low / monthly_surplus_high: a realistic MONTHLY surplus range in EUR\n"
+                f"- visa_speed_weeks: a short string like '2-4 weeks' reflecting how fast THIS candidate could "
+                f"realistically get authorized to work there given their nationality/visa situation. If they're "
+                f"already an EU/EEA citizen and the country is in the EU/EEA, say no visa is needed at all.\n"
+                f"- visa_favorability: 'green' (fast/no visa needed), 'yellow' (moderate friction), or "
+                f"'red' (slow/restrictive) — from THIS candidate's perspective\n"
                 f"- qol_stars: overall quality of life, integer 1-5\n"
-                f"- remote_culture_stars: how strong remote/hybrid work culture is in this country's tech sector, integer 1-5\n"
-                f"- edge: ONE short phrase (under 10 words) on why this country specifically suits or doesn't "
-                f"suit THIS candidate — reference their visa situation or languages if relevant (e.g. a language "
-                f"they speak unlocking a market, or their citizenship giving them fast/no-visa access)\n"
+                f"- remote_culture_stars: how strong remote/hybrid culture is in this country's tech sector, integer 1-5\n"
+                f"- edge: ONE short phrase (under 10 words) on why this country specifically suits or doesn't suit "
+                f"THIS candidate — reference their visa situation or languages if relevant\n"
                 f"- note: one sentence on what the estimate is based on\n\n"
                 'Return ONLY JSON with exactly these keys: {"salary_eur": int, "col_eur": int, '
                 '"monthly_surplus_low": int, "monthly_surplus_high": int, "visa_speed_weeks": str, '
@@ -522,12 +566,9 @@ def refresh_country_data(countries, role, seniority):
             )
             try:
                 res = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
+                    model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.3,
                 )
-                raw = re.sub(r"^```json|```$", "", res.choices[0].message.content.strip(), flags=re.MULTILINE).strip()
-                parsed = json.loads(raw)
+                parsed = _json_from_response(res.choices[0].message.content)
                 salary = int(parsed.get("salary_eur", 0))
                 col = int(parsed.get("col_eur", 0))
                 entry = {
@@ -560,18 +601,15 @@ def refresh_country_data(countries, role, seniority):
 def composite_priority_score(entry):
     """Weighted score used only to order the ranking table — surplus, QoL, remote culture,
     and visa favorability all contribute, which is why a high-salary/slow-visa country can
-    rank below a lower-salary/fast-visa one, matching how people actually prioritize moves."""
+    rank below a lower-salary/fast-visa one."""
     visa_bonus = {"green": 20, "yellow": 5, "red": -15}.get(entry.get("visa_favorability"), 0)
     surplus_mid = (entry.get("monthly_surplus_low", 0) + entry.get("monthly_surplus_high", 0)) / 2
     return surplus_mid * 0.5 + entry.get("qol_stars", 0) * 20 + entry.get("remote_culture_stars", 0) * 15 + visa_bonus
 
 
-
-
-
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # CV OPTIMIZATION — strictly grounded LaTeX edits + diff summary, no fabrication
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 def optimize_cv_for_role(tex_source, cv_text, job_title, job_body):
     client = get_client()
     system = (
@@ -588,55 +626,36 @@ def optimize_cv_for_role(tex_source, cv_text, job_title, job_body):
         'Return ONLY JSON: {"tex": "<full modified latex document>", "changes": ["short bullet describing each change made and why", "..."]}'
     )
     res = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=4000,
+        temperature=0.3, max_tokens=4000,
     )
-    raw = res.choices[0].message.content.strip()
-    raw = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
     try:
-        parsed = json.loads(raw)
+        parsed = _json_from_response(res.choices[0].message.content)
         return parsed.get("tex", ""), parsed.get("changes", [])
     except Exception:
-        return raw, ["(model did not return structured JSON — showing raw output)"]
+        return res.choices[0].message.content, ["(model did not return structured JSON — showing raw output)"]
 
 
-def compute_country_fit(country):
-    """Live fit % for a country — always reflects whatever has been scouted so far,
-    not a snapshot frozen at the last time salary/col data was refreshed."""
-    country_roles = [c for c in db["companies"].values() if c.get("country") == country]
-    scores = [c["fit"] for c in country_roles if "fit" in c]
-    if not scores:
-        return None, "no roles scouted yet"
-    return round(sum(scores) / len(scores)), f"{len(scores)} scouted role(s)"
-
-
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # VIEW 1 — DASHBOARD
-# --------------------------------------------------------------------------------------
-def _stars(n):
-    n = max(0, min(5, int(n)))
-    return "★" * n + "☆" * (5 - n)
-
-
+# ============================================================================================
 def view_dashboard():
     st.title("🌍 Country Ranking")
     prof = db["profile"]
 
     countries = country_picker("Countries to evaluate", "dash_countries", prof["countries"])
-    if st.button("🔄 Refresh market & visa data", use_container_width=False):
+    if st.button("🔄 Refresh market & visa data"):
         with st.spinner("Searching current salary, cost-of-living and visa data..."):
             refresh_country_data(countries, prof["role"], prof["seniority"])
         st.rerun()
 
-    cached = [c for c in countries
-              if c in db["country_cache"] and "qol_stars" in db["country_cache"][c]]
-    stale = [c for c in countries
-             if c in db["country_cache"] and "qol_stars" not in db["country_cache"][c]]
+    cached = [c for c in countries if c in db["country_cache"] and "qol_stars" in db["country_cache"][c]]
+    stale = [c for c in countries if c in db["country_cache"] and "qol_stars" not in db["country_cache"][c]]
     if stale:
-        st.warning(f"{len(stale)} countr(y/ies) have data cached from before the ranking table was added "
+        st.warning(f"{len(stale)} countr(y/ies) have data cached from an older schema "
                    f"({', '.join(stale)}) — click **Refresh market & visa data** to re-estimate them.")
+
     if not cached:
         st.info("No ranking data yet — click **Refresh market & visa data** above to generate it "
                 "(estimates are personalized to your visa situation and languages in Profile).")
@@ -662,33 +681,21 @@ def view_dashboard():
             surplus_range = f"€{d['monthly_surplus_low']:,}-{d['monthly_surplus_high']:,}" \
                 if d.get("monthly_surplus_high") else "—"
             rows_html += row_tpl.format(
-                border=BORDER,
-                priority=medals.get(i, str(i + 1)),
-                flag=COUNTRY_FLAGS.get(country, "🏳️"),
-                country=country,
-                surplus=surplus_range,
+                border=BORDER, priority=medals.get(i, str(i + 1)),
+                flag=COUNTRY_FLAGS.get(country, "🏳️"), country=country, surplus=surplus_range,
                 visa_icon=VISA_ICON.get(d.get("visa_favorability"), "⚠️"),
                 visa_weeks=d.get("visa_speed_weeks", "—"),
-                qol=_stars(d.get("qol_stars", 0)),
-                remote=_stars(d.get("remote_culture_stars", 0)),
+                qol=_stars(d.get("qol_stars", 0)), remote=_stars(d.get("remote_culture_stars", 0)),
                 edge=d.get("edge", ""),
             )
-
         header = (
             '<tr style="color:#8b909c; text-align:left;">'
-            '<th style="padding:6px 8px;">Priority</th>'
-            '<th style="padding:6px 8px;">Country</th>'
-            '<th style="padding:6px 8px;">Est. Monthly Surplus</th>'
-            '<th style="padding:6px 8px;">Visa Speed</th>'
-            '<th style="padding:6px 8px;">QoL</th>'
-            '<th style="padding:6px 8px;">Remote/Hybrid Culture</th>'
-            '<th style="padding:6px 8px;">Your Edge</th>'
-            '</tr>'
+            '<th style="padding:6px 8px;">Priority</th><th style="padding:6px 8px;">Country</th>'
+            '<th style="padding:6px 8px;">Est. Monthly Surplus</th><th style="padding:6px 8px;">Visa Speed</th>'
+            '<th style="padding:6px 8px;">QoL</th><th style="padding:6px 8px;">Remote/Hybrid Culture</th>'
+            '<th style="padding:6px 8px;">Your Edge</th></tr>'
         )
-        table_html = (
-            '<table style="width:100%; border-collapse:collapse; font-size:14px;">'
-            + header + rows_html + '</table>'
-        )
+        table_html = f'<table style="width:100%; border-collapse:collapse; font-size:14px;">{header}{rows_html}</table>'
         st.markdown(table_html, unsafe_allow_html=True)
 
         oldest = min(db["country_cache"][c]["updated_at"] for c in cached)
@@ -714,7 +721,6 @@ def view_dashboard():
     label = f"{COUNTRY_FLAGS.get(picked, '🌍')} {picked} — Companies" if picked != "All countries" \
         else "🌍 All Countries — Companies"
     st.markdown(f"#### {label}" + (" (sorted by fit to your CV)" if has_cv else ""))
-
     if not has_cv:
         st.caption("Upload your CV in Profile to rank these by fit — showing them in scouted order for now.")
 
@@ -725,23 +731,21 @@ def view_dashboard():
     table_rows = [{
         "Company": c.get("company_name") or extract_company_name(c["href"]),
         "Country": c.get("country", "Unknown"),
-        "Stack": c.get("stack") or extract_tech_stack(c.get("title", "") + " " + c.get("body", ""), ""),
+        "Stack": c.get("stack") or extract_tech_stack(c.get("title", ""), c.get("body", "")),
         "Role": c.get("title", ""),
         "Fit %": f"{c.get('fit', 0)}%" if has_cv else "—",
         "Career Page": c["href"],
     } for c in entries]
 
     st.dataframe(
-        pd.DataFrame(table_rows),
-        use_container_width=True,
-        hide_index=True,
+        pd.DataFrame(table_rows), use_container_width=True, hide_index=True,
         column_config={"Career Page": st.column_config.LinkColumn("Career Page", display_text=None)},
     )
 
 
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # VIEW 2 — COMPANIES
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 def view_companies():
     st.title("🏢 Companies & Roles")
     prof = db["profile"]
@@ -763,28 +767,7 @@ def view_companies():
                     jid = job_id(href, h.get("title", ""))
                     if jid in db["companies"]:
                         continue  # never re-show something already tracked
-                    text_for_scoring = h.get("title", "") + " " + h.get("body", "")
-                    if fetch_full_page:
-                        page_text = fetch_page_text(href)
-                        if page_text:
-                            text_for_scoring += " " + page_text
-                    fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
-                    db["companies"][jid] = {
-                        "title": h.get("title", "Untitled role"),
-                        "body": h.get("body", ""),
-                        "href": href,
-                        "country": h.get("_country", "Unknown"),
-                        "company_name": extract_company_name(href),
-                        "stack": extract_tech_stack(text_for_scoring, ""),
-                        "level": extract_level(h.get("title", "")),
-                        "visa_support": extract_visa_support(text_for_scoring),
-                        "salary_mentioned": extract_salary_mention(text_for_scoring),
-                        "fit": fit,
-                        "matched_skills": matched,
-                        "liked": None,
-                        "status": None,
-                        "logged_at": None,
-                    }
+                    db["companies"][jid] = build_company_record(h, db["cv_skills"], fetch_full_page)
                     new_count += 1
                 except Exception:
                     continue
@@ -840,21 +823,24 @@ def view_companies():
                     msg += f" Skipped {failed} that errored out."
                 st.success(msg)
 
+        if st.button("🧹 Remove aggregator-board entries", use_container_width=True):
+            before = len(db["companies"])
+            db["companies"] = {jid: c for jid, c in db["companies"].items() if not _is_aggregator(c.get("href", ""))}
+            removed = before - len(db["companies"])
+            save_db(db)
+            st.success(f"Removed {removed} aggregator entr(y/ies) already in your list.")
+
         st.divider()
+        country_options = ["All"] + sorted({c["country"] for c in db["companies"].values()})
         filter_country = st.selectbox(
-            "Filter by country", ["All"] + sorted({c["country"] for c in db["companies"].values()}),
-            index=(["All"] + sorted({c["country"] for c in db["companies"].values()})).index(
-                st.session_state.get("companies_country_filter", "All")
-            ) if st.session_state.get("companies_country_filter") in
-                 (["All"] + sorted({c["country"] for c in db["companies"].values()})) else 0,
+            "Filter by country", country_options,
+            index=country_options.index(st.session_state.get("companies_country_filter", "All"))
+            if st.session_state.get("companies_country_filter") in country_options else 0,
         )
         min_fit = st.slider("Minimum fit %", 0, 100, 0)
         liked_only = st.checkbox("Liked only")
         hide_decided = st.checkbox("Hide applied/skipped", value=True)
-        level_filter = st.multiselect(
-            "Level", ["Internship", "Junior", "Mid", "Senior", "Staff/Lead", "Not specified"],
-            default=[], help=LEVEL_TOOLTIP,
-        )
+        level_filter = st.multiselect("Level", LEVEL_OPTIONS, default=[], help=LEVEL_TOOLTIP)
         visa_filter = st.selectbox("Visa support mentioned", ["Any", "Yes", "No"])
 
     entries = [(jid, c) for jid, c in db["companies"].items()]
@@ -904,7 +890,7 @@ def view_companies():
                 f'<h3 style="margin:0;">{c["title"]}</h3>'
                 f'<span class="fit-badge">{c.get("fit", 0)}% fit</span>'
                 '</div>'
-                f'<p class="small-muted">📍 {c["country"]}</p>'
+                f'<p class="small-muted">📍 {c["country"]} · 🏢 {c.get("company_name","")}</p>'
                 f'<div style="margin:8px 0;">'
                 f'<span class="pill">🎚 {level}</span>'
                 f'<span class="pill">{visa_icon} Visa: {visa}</span>'
@@ -918,7 +904,7 @@ def view_companies():
             )
             st.markdown(card_html, unsafe_allow_html=True)
 
-            b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1.4])
+            b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
             if b1.button("👍 Like", key=f"like_{jid}"):
                 db["companies"][jid]["liked"] = True
                 save_db(db)
@@ -967,9 +953,9 @@ def view_companies():
                     st.caption("Compile locally with pdflatex/Overleaf to get the PDF.")
 
 
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # VIEW 3 — PROFILE
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 def view_profile():
     st.title("👤 Profile & Preferences")
     prof = db["profile"]
@@ -992,15 +978,8 @@ def view_profile():
         with c2:
             prof["nationality"] = st.text_input("Nationality (for visa estimates)", prof["nationality"])
             prof["visa_status"] = st.selectbox(
-                "Visa situation", [
-                    "EU/EEA citizen (no visa needed)",
-                    "Non-EU — needs work visa/sponsorship",
-                    "Already hold a valid work permit",
-                ],
-                index=["EU/EEA citizen (no visa needed)", "Non-EU — needs work visa/sponsorship",
-                       "Already hold a valid work permit"].index(prof["visa_status"])
-                if prof["visa_status"] in ["EU/EEA citizen (no visa needed)", "Non-EU — needs work visa/sponsorship",
-                                            "Already hold a valid work permit"] else 0,
+                "Visa situation", VISA_STATUS_OPTIONS,
+                index=VISA_STATUS_OPTIONS.index(prof["visa_status"]) if prof["visa_status"] in VISA_STATUS_OPTIONS else 0,
             )
             prof["languages"] = st.text_input("Languages you speak (comma separated)", prof["languages"])
             prof["lifestyle"] = st.text_input("Lifestyle assumption (for cost-of-living calc)", prof["lifestyle"])
@@ -1074,9 +1053,9 @@ def view_profile():
                 st.bar_chart(per_country)
 
 
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 # NAVIGATION
-# --------------------------------------------------------------------------------------
+# ============================================================================================
 if "nav" not in st.session_state:
     st.session_state["nav"] = "Dashboard"
 
