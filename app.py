@@ -964,11 +964,11 @@ def _render_role_card(jid, c, prof):
 
 
 def view_companies():
-    st.title("🏢 Companies & Roles")
     prof = db["profile"]
+    subview = st.session_state.get("companies_subview", "career_page")
+    st.title(SOURCE_LABELS.get(subview, "🏢 Companies & Roles"))
 
-    with st.sidebar:
-        st.subheader("Search")
+    with st.expander("🔭 Search & scout settings", expanded=not db["companies"]):
         role = st.text_input("Target role", prof["role"])
         countries = country_picker("Countries", "companies_countries", prof["countries"])
         results_per_country = st.slider("Results per country", 5, 25, 10)
@@ -990,7 +990,8 @@ def view_companies():
                     continue
             return new_count
 
-        if st.button("🔭 Scout all three sources", use_container_width=True):
+        b1, b2 = st.columns(2)
+        if b1.button("🔭 Scout all three sources", use_container_width=True):
             if not db["cv_skills"]:
                 st.warning("Upload & sync your CV in Profile first for real fit scoring.")
             total_new, total_found = 0, 0
@@ -1009,7 +1010,7 @@ def view_companies():
             save_db(db)
             st.success(f"Found {total_found} candidate roles across all sources ({total_new} new).")
 
-        if st.button("🔁 Load more career pages (alt ATS hosts)", use_container_width=True):
+        if b2.button("🔁 Load more career pages (alt ATS hosts)", use_container_width=True):
             with st.spinner("Searching additional ATS platforms..."):
                 hits, errors = search_career_pages(role, countries, max_results_per_query=results_per_country,
                                                     site_filter=ALT_CAREER_SITE_FILTER)
@@ -1019,7 +1020,8 @@ def view_companies():
                     st.warning(f"{len(errors)} search querie(s) failed: " + "; ".join(errors[:3]))
                 st.success(f"Found {len(hits)} candidate roles ({new_count} new).")
 
-        if st.button("♻️ Recompute stack & fit for existing entries", use_container_width=True):
+        b3, b4 = st.columns(2)
+        if b3.button("♻️ Recompute stack & fit for existing entries", use_container_width=True):
             with st.spinner("Re-scoring already-scouted roles with the improved detection..."):
                 updated, failed = 0, 0
                 for jid, c in list(db["companies"].items()):
@@ -1048,67 +1050,67 @@ def view_companies():
                     msg += f" Skipped {failed} that errored out."
                 st.success(msg)
 
-        if st.button("🧹 Clear all scouted entries", use_container_width=True):
+        if b4.button("🧹 Clear all scouted entries", use_container_width=True):
             db["companies"] = {}
             save_db(db)
             st.success("Cleared. Your liked/disliked history and application log are gone with it — "
                        "scout again to rebuild the list.")
 
-        st.divider()
-        country_options = ["All"] + sorted({c["country"] for c in db["companies"].values()})
+    # --- Filters, front and center at the top of the page -------------------------
+    country_options = ["All"] + sorted({c["country"] for c in db["companies"].values()})
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
         filter_country = st.selectbox(
-            "Filter by country", country_options,
+            "Country", country_options,
             index=country_options.index(st.session_state.get("companies_country_filter", "All"))
             if st.session_state.get("companies_country_filter") in country_options else 0,
         )
+    with f2:
         min_fit = st.slider("Minimum fit %", 0, 100, 0)
-        liked_only = st.checkbox("Liked only")
-        hide_decided = st.checkbox("Hide applied/skipped", value=True)
+    with f3:
         level_filter = st.multiselect("Level", LEVEL_OPTIONS, default=[], help=LEVEL_TOOLTIP)
+    with f4:
         visa_filter = st.selectbox("Visa support mentioned", ["Any", "Yes", "No"])
+    f5, f6 = st.columns(2)
+    with f5:
+        liked_only = st.checkbox("Liked only")
+    with f6:
+        hide_decided = st.checkbox("Hide applied/skipped", value=True)
+    st.divider()
 
-    def apply_shared_filters(entries):
-        if filter_country != "All":
-            entries = [(j, c) for j, c in entries if c["country"] == filter_country]
-        if liked_only:
-            entries = [(j, c) for j, c in entries if c.get("liked")]
-        if hide_decided:
-            entries = [(j, c) for j, c in entries if not c.get("status")]
-        if level_filter:
-            entries = [(j, c) for j, c in entries if c.get("level", "Not specified") in level_filter]
-        if visa_filter != "Any":
-            entries = [(j, c) for j, c in entries if c.get("visa_support") == visa_filter]
-        entries = [(j, c) for j, c in entries if c.get("fit", 0) >= min_fit]
-        entries.sort(key=lambda jc: jc[1].get("fit", 0), reverse=True)
-        return entries
+    entries = [(jid, c) for jid, c in db["companies"].items()
+               if (c.get("source") or determine_source(c.get("href", ""))) == subview]
+    if filter_country != "All":
+        entries = [(j, c) for j, c in entries if c["country"] == filter_country]
+    if liked_only:
+        entries = [(j, c) for j, c in entries if c.get("liked")]
+    if hide_decided:
+        entries = [(j, c) for j, c in entries if not c.get("status")]
+    if level_filter:
+        entries = [(j, c) for j, c in entries if c.get("level", "Not specified") in level_filter]
+    if visa_filter != "Any":
+        entries = [(j, c) for j, c in entries if c.get("visa_support") == visa_filter]
+    entries = [(j, c) for j, c in entries if c.get("fit", 0) >= min_fit]
+    entries.sort(key=lambda jc: jc[1].get("fit", 0), reverse=True)
 
-    all_entries = [(jid, c) for jid, c in db["companies"].items()]
-    tab_order = ["linkedin", "career_page", "job_board"]
-    tabs = st.tabs([SOURCE_LABELS[s] for s in tab_order])
+    if not entries:
+        st.info("No roles here yet matching these filters. Use **Search & scout settings** above.")
+        return
 
-    for source_key, tab in zip(tab_order, tabs):
-        with tab:
-            source_entries = [(j, c) for j, c in all_entries
-                               if (c.get("source") or determine_source(c.get("href", ""))) == source_key]
-            entries = apply_shared_filters(source_entries)
-            if not entries:
-                st.info("No roles here yet matching these filters. Use **Scout all three sources** in the sidebar.")
-                continue
-            for jid, c in entries:
-                with st.container():
-                    _render_role_card(jid, c, prof)
+    for jid, c in entries:
+        with st.container():
+            _render_role_card(jid, c, prof)
 
 
 # ============================================================================================
 # VIEW 3 — PROFILE
 # ============================================================================================
 def view_profile():
-    st.title("👤 Profile & Preferences")
     prof = db["profile"]
+    subview = st.session_state.get("profile_subview", "Preferences")
+    st.title(f"👤 {subview}")
 
-    tabs = st.tabs(["Preferences", "Master CV", "Liked / Disliked", "Application Tracker"])
-
-    with tabs[0]:
+    if subview == "Preferences":
         prof["countries"] = country_picker("Target countries", "profile_countries", prof["countries"])
         c1, c2 = st.columns(2)
         with c1:
@@ -1134,7 +1136,7 @@ def view_profile():
             save_db(db)
             st.success("Saved.")
 
-    with tabs[1]:
+    elif subview == "Master CV":
         c1, c2 = st.columns(2)
         with c1:
             pdf = st.file_uploader("Master CV (PDF)", type="pdf")
@@ -1159,7 +1161,7 @@ def view_profile():
             else:
                 st.info("No CV synced yet.")
 
-    with tabs[2]:
+    elif subview == "Liked / Disliked":
         liked = [(j, c) for j, c in db["companies"].items() if c.get("liked") is True]
         disliked = [(j, c) for j, c in db["companies"].items() if c.get("liked") is False]
         lc, dc = st.columns(2)
@@ -1180,7 +1182,7 @@ def view_profile():
                     save_db(db)
                     st.rerun()
 
-    with tabs[3]:
+    elif subview == "Application Tracker":
         logged = [c for c in db["companies"].values() if c.get("status")]
         if not logged:
             st.info("Nothing logged yet — apply or skip roles in Companies.")
@@ -1200,15 +1202,46 @@ def view_profile():
 
 
 # ============================================================================================
-# NAVIGATION
+# NAVIGATION — collapsible tree in the sidebar (Dashboard is a direct link; Companies and
+# Profile expand to reveal their sub-views, each of which becomes the whole main page)
 # ============================================================================================
+PROFILE_SUBVIEWS = ["Preferences", "Master CV", "Liked / Disliked", "Application Tracker"]
+COMPANIES_SUBVIEWS = ["linkedin", "career_page", "job_board"]
+
 if "nav" not in st.session_state:
     st.session_state["nav"] = "Dashboard"
+if "companies_subview" not in st.session_state:
+    st.session_state["companies_subview"] = "career_page"
+if "profile_subview" not in st.session_state:
+    st.session_state["profile_subview"] = "Preferences"
 
-nav = st.sidebar.radio("Navigate", ["Dashboard", "Companies", "Profile"],
-                        index=["Dashboard", "Companies", "Profile"].index(st.session_state["nav"]))
-st.session_state["nav"] = nav
+with st.sidebar:
+    st.markdown("### 🐆 Job Copilot")
 
+    if st.button("🌍 Dashboard", key="nav_dashboard", use_container_width=True,
+                 type="primary" if st.session_state["nav"] == "Dashboard" else "secondary"):
+        st.session_state["nav"] = "Dashboard"
+        st.rerun()
+
+    with st.expander("🏢 Companies", expanded=(st.session_state["nav"] == "Companies")):
+        for key in COMPANIES_SUBVIEWS:
+            is_active = st.session_state["nav"] == "Companies" and st.session_state["companies_subview"] == key
+            if st.button(SOURCE_LABELS[key], key=f"nav_companies_{key}", use_container_width=True,
+                         type="primary" if is_active else "secondary"):
+                st.session_state["nav"] = "Companies"
+                st.session_state["companies_subview"] = key
+                st.rerun()
+
+    with st.expander("👤 Profile", expanded=(st.session_state["nav"] == "Profile")):
+        for label in PROFILE_SUBVIEWS:
+            is_active = st.session_state["nav"] == "Profile" and st.session_state["profile_subview"] == label
+            if st.button(label, key=f"nav_profile_{label}", use_container_width=True,
+                         type="primary" if is_active else "secondary"):
+                st.session_state["nav"] = "Profile"
+                st.session_state["profile_subview"] = label
+                st.rerun()
+
+nav = st.session_state["nav"]
 if nav == "Dashboard":
     view_dashboard()
 elif nav == "Companies":
