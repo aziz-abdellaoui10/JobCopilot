@@ -6,94 +6,129 @@ from groq import Groq
 from datetime import datetime
 import pypdf
 import os
+from duckduckgo_search import DDGS
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="Personal Job Copilot", layout="wide", page_icon="🚀")
+# --- APP CONFIG & SECRETS ---
+st.set_page_config(page_title="Job Copilot PRO", layout="wide")
 
-# Setup Groq Client (using Streamlit Secrets for security)
 if "GROQ_API_KEY" in st.secrets:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 else:
-    st.error("Please add your GROQ_API_KEY to Streamlit Secrets.")
+    st.error("Please add GROQ_API_KEY to Streamlit Secrets.")
     st.stop()
 
-# --- DATA PERSISTENCE ---
-# Since this is deployed, we store the "Database" in a local JSON file 
-# Note: For production, you'd connect this to a DB, but for personal use, a file is fine.
-DB_PATH = "application_tracker.json"
+# --- DATABASE SETUP ---
+DB_PATH = "user_data.json"
 if not os.path.exists(DB_PATH):
     with open(DB_PATH, "w") as f:
-        json.dump({"applied": [], "skipped": [], "liked": []}, f)
+        json.dump({"applied": [], "profile_summary": "", "skills": []}, f)
 
-def load_db():
+def get_db():
     with open(DB_PATH, "r") as f: return json.load(f)
 
 def save_db(data):
     with open(DB_PATH, "w") as f: json.dump(data, f)
 
-# --- VIEW 1: DASHBOARD (Market Data) ---
+# --- CORE ENGINE: THE SCOUTER ---
+def scout_real_jobs(role, country):
+    with DDGS() as ddgs:
+        query = f"site:lever.co OR site:greenhouse.io OR site:workable.com '{role}' in {country} jobs"
+        results = [r for r in ddgs.text(query, max_results=5)]
+    return results
+
+# --- VIEW 1: DASHBOARD ---
 def view_dashboard():
-    st.title("🌍 Global Market Dashboard")
-    # Using Teleport API (Free/No Key)
-    cities = ["berlin", "london", "amsterdam", "new-york-city", "singapore"]
-    market_data = []
+    st.title("🌍 Market Intelligence")
     
-    for city in cities:
+    # Pre-defined hubs for the table
+    hubs = ["Berlin", "London", "Amsterdam", "New York", "Singapore"]
+    market_stats = []
+    
+    for city in hubs:
+        # Fetching live scores from Teleport
+        slug = city.lower().replace(" ", "-")
         try:
-            res = requests.get(f"https://api.teleport.org/api/urban_areas/slug:{city}/scores/").json()
+            res = requests.get(f"https://api.teleport.org/api/urban_areas/slug:{slug}/scores/").json()
             score = round(res['teleport_city_score'], 1)
-            market_data.append({"City": city.title(), "Fit %": "Calculated", "Market Score": score, "Status": "High Demand"})
+            # Dummy salary math for demo
+            avg_sal = 85000 if score > 60 else 60000 
+            market_stats.append({
+                "City": city, 
+                "Market Fit %": f"{int(score)}%", 
+                "Avg Salary": f"${avg_sal:,}", 
+                "Quality of Life": score
+            })
         except:
             continue
             
-    st.table(pd.DataFrame(market_data))
+    if market_stats:
+        st.table(pd.DataFrame(market_stats))
+    else:
+        st.warning("Could not load market data. Check your internet connection.")
 
-# --- VIEW 2: COMPANIES (The Scout) ---
+# --- VIEW 2: COMPANIES & TAILORING ---
 def view_companies():
-    st.title("🏢 Role Discovery & Tailoring")
+    st.title("🏢 Real-Time Scouting")
     
-    # Simple Job Search via DuckDuckGo (Free API workaround)
-    role_query = st.text_input("What role should I scout for?", "Senior Software Engineer")
-    
-    if st.button("Search for Openings"):
-        st.info(f"Searching for {role_query} roles...")
-        # Mocking search results for the UI demo - in production, integrate Tavily/Serper
-        results = [
-            {"company": "Stripe", "role": "Senior Backend Engineer", "link": "https://stripe.com/jobs", "loc": "Remote/Berlin"},
-            {"company": "Revolut", "role": "Lead Engineer", "link": "https://revolut.com/jobs", "loc": "London"}
-        ]
-        
-        for job in results:
-            with st.expander(f"{job['role']} @ {job['company']}"):
-                st.write(f"Location: {job['loc']}")
-                col1, col2, col3 = st.columns(3)
-                if col1.button(f"Optimize CV", key=job['company']):
-                    st.success("Generating LaTeX variant based on original source...")
-                    # The Logic: AI takes job desc + original tex -> outputs modified tex
-                    st.code("% Simplified LaTeX Output\n\\section{Summary}\nExpert in systems for " + job['company'])
-                
-                if col2.link_button("Apply Now", job['link']):
-                    pass # Opens in new tab
+    col1, col2 = st.columns([2,1])
+    with col1:
+        target_role = st.text_input("Target Job Title", "Software Engineer")
+    with col2:
+        target_loc = st.text_input("Target Location", "Europe")
 
-                if col3.button("Mark as Applied", key=f"app_{job['company']}"):
-                    db = load_db()
-                    db['applied'].append({"company": job['company'], "date": str(datetime.now())})
-                    save_db(db)
-                    st.toast("Application Tracked!")
+    if st.button("🔍 Scout Live Roles"):
+        with st.spinner("Browsing career pages..."):
+            jobs = scout_real_jobs(target_role, target_loc)
+            if not jobs:
+                st.error("No roles found. Try a broader search.")
+            
+            for job in jobs:
+                with st.expander(f"📌 {job['title']}"):
+                    st.write(f"**Source:** {job['href']}")
+                    st.write(job['body'][:300] + "...")
+                    
+                    c1, c2, c3 = st.columns(3)
+                    if c1.button("✨ Optimize CV", key=job['href']):
+                        # AI Tailoring Logic
+                        prompt = f"Optimize this CV for: {job['title']}. Use only existing facts. Output 3 strong bullet points."
+                        chat = client.chat.completions.create(
+                            model="llama3-8b-8192",
+                            messages=[{"role": "user", "content": prompt}]
+                        )
+                        st.info("Tailored Highlights for your CV:")
+                        st.write(chat.choices[0].message.content)
+                    
+                    c2.link_button("🔗 Open Career Page", job['href'])
+                    
+                    if c3.button("✅ I Applied", key=f"app_{job['href']}"):
+                        db = get_db()
+                        db['applied'].append({"job": job['title'], "date": str(datetime.now())})
+                        save_db(db)
+                        st.balloons()
 
 # --- VIEW 3: PROFILE ---
 def view_profile():
-    st.title("👤 My Profile")
-    uploaded_pdf = st.file_uploader("Original CV (PDF)", type="pdf")
-    uploaded_tex = st.file_uploader("Original Source (LaTeX)", type="tex")
+    st.title("👤 Canonical Profile")
     
-    st.divider()
-    db = load_db()
-    st.subheader("Application History")
-    st.write(pd.DataFrame(db['applied']))
+    up_pdf = st.file_uploader("Upload Original PDF", type="pdf")
+    if up_pdf:
+        reader = pypdf.PdfReader(up_pdf)
+        text = ""
+        for page in reader.pages: text += page.extract_text()
+        st.success("PDF Parsed!")
+        with st.expander("Show Extracted Text"):
+            st.write(text)
 
-# --- ROUTING ---
-page = st.sidebar.selectbox("Go to", ["Dashboard", "Companies", "Profile"])
+    st.divider()
+    st.subheader("Your Application Journey")
+    db = get_db()
+    if db['applied']:
+        st.dataframe(pd.DataFrame(db['applied']))
+    else:
+        st.write("You haven't applied to any roles yet.")
+
+# --- NAVIGATION ---
+page = st.sidebar.radio("Navigate", ["Dashboard", "Companies", "Profile"])
 if page == "Dashboard": view_dashboard()
 elif page == "Companies": view_companies()
 elif page == "Profile": view_profile()
