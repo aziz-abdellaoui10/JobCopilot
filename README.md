@@ -27,36 +27,42 @@ iterated on.
 ## What's in it
 
 **Dashboard**
+- Hero stats row: roles scouted, liked, applied, and average match score of liked roles.
 - Final Ranking Table: Priority (medals for top 3), Country, Est. Monthly Surplus, Visa
   Speed, QoL stars, Remote/Hybrid Culture stars, and a personalized "Your Edge" phrase.
   Ranking is a weighted composite (surplus + QoL + remote culture + visa favorability),
   not pure salary order.
-- Companies sub-table filtered by country (or all), sorted by fit once your CV is synced
-  — otherwise shown in scouted order rather than faking a sort with no data behind it.
+- Companies sub-table filtered by country (or all), sorted by Match Score once your CV is
+  synced — otherwise shown in scouted order rather than faking a sort with no data behind it.
 - Region quick-add (Europe, North America, DACH, Nordics, Benelux) next to the country
   picker.
 
-**Companies**
-- Three sub-tabs: **🔗 LinkedIn Jobs**, **🏢 Career Pages**, **📋 Job Boards** (Indeed, Glassdoor,
-  Monster, ZipRecruiter, StepStone, TotalJobs, Reed, Adzuna, etc.) — one click ("Scout all
-  three sources") searches all three categories and each posting lands in the tab matching
-  where it actually came from.
-- Career Pages still uses the strict career-page engine (Lever, Greenhouse, Ashby, Workday,
-  SmartRecruiters, Workable, Personio, Teamtailor, JobVite, Breezy, Recruitee) via a
-  three-tier query (narrow → combined ATS → open-with-exclusions), explicitly excluding
-  LinkedIn/job-board domains so it doesn't just duplicate the other two tabs.
+**Companies** — three tabs (🔗 LinkedIn Jobs, 🏢 Career Pages, 📋 Job Boards)
+- Scouting searches all three sources in one click: real company career pages (Lever,
+  Greenhouse, Ashby, Workday, SmartRecruiters, Workable, Personio, Teamtailor, JobVite,
+  Breezy, Recruitee) via a three-tier query, plus dedicated LinkedIn and general job-board
+  (Indeed, Glassdoor, Monster, etc.) searches. Connection-level failures are detected and
+  fail fast instead of burning time retrying a dead network path.
+- **Match Score** (★ rating + %): replaces the old flat "fit %" badge. Starts from CV-skill
+  overlap, then adjusts for visa fit, salary-floor fit, and a lightweight "more like this"
+  boost — postings with a similar tech stack to companies you've already liked score higher,
+  a simple recommendation signal built entirely from your own activity (this is a private
+  single-user tool, so there's no cross-user data to learn from). Hover the badge for the
+  reasons behind the number.
+- **Top pick** ribbon on the best 1-3 cards per page once sorted by match.
+- **Freshness badges** ("🆕 Posted today", "📅 Posted 3 days ago") — only shown when the
+  posting itself states an age; never guessed.
+- Company favicons pulled in automatically next to each role title.
+- Sort by Best match / Recently scouted / Company name; filters for country, minimum fit,
+  level (with tooltip), visa-support; pagination via "Show more" instead of dumping the
+  whole list at once.
 - "Load more career pages (alt ATS hosts)" pulls from the alternate ATS set. "Recompute
   stack & fit" re-scores everything already scouted with current logic. "Clear all scouted
   entries" wipes the list for a clean restart (also clears your liked/applied history, so
   it's a deliberate reset, not routine cleanup).
-- Filters (country, minimum fit %, liked-only, hide applied/skipped, level, visa-support)
-  apply within whichever tab you're viewing.
-- Per-role card: transparent fit % (keyword overlap against your parsed CV skills, shown
-  as matched-skill pills), level, visa-support indicator, a separate "apply advice" %
-  (fit adjusted for visa fit and salary-floor fit, with a hover tooltip explaining why),
-  and a salary line that only shows a JD-stated figure as "stated in posting" — otherwise
-  it falls back to a clearly-labeled AI country-average estimate, or says outright that
-  nothing's available.
+- Salary line only shows a JD-stated figure as "stated in posting" — otherwise it falls
+  back to a clearly-labeled AI country-average estimate, or says outright that nothing's
+  available.
 - Apply flow: opening the link immediately surfaces an "Applied / Skipped" prompt that
   logs a timestamp; already-decided roles get filtered out of future views.
 - Optimize CV: LaTeX tailoring restricted to reordering/rewording existing content —
