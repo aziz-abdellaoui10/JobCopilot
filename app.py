@@ -4,9 +4,10 @@ Personal Job Copilot — private, local-use Streamlit app.
 Views:
   1. Dashboard  — personalized country ranking (surplus, visa speed, QoL, remote culture,
                   "your edge") + a companies table sorted by fit once your CV is synced
-  2. Companies  — scout roles from real company career pages, filter by level/visa/fit,
-                  like/dislike, log applied/skipped, get an "apply advice" score, and
-                  generate a strictly-truthful tailored CV variant per role
+  2. Companies  — scout roles from LinkedIn, company career pages, and general job boards
+                  (3 tabs), filter by level/visa/fit, like/dislike, log applied/skipped,
+                  get a starred Match Score with "why", and generate a strictly-truthful
+                  tailored CV variant per role
   3. Profile    — preferences (incl. visa situation, languages), master CV files,
                   liked/disliked list, application tracker with stats
 
@@ -364,6 +365,29 @@ def extract_salary_mention(text):
     return match.group(0).strip() if match else None
 
 
+FRESHNESS_REGEX = re.compile(
+    r'\b(today|just posted|new|(\d+)\s*(hour|hours|hr|hrs)\s*ago|(\d+)\s*(day|days)\s*ago|'
+    r'(\d+)\s*(week|weeks)\s*ago|(\d+)\s*(month|months)\s*ago|yesterday)\b',
+    re.IGNORECASE,
+)
+
+
+def extract_freshness(text):
+    """Only claims a posting age if the page/snippet actually states one — never guessed.
+    Returns a short display string, or None if nothing was found."""
+    if not text:
+        return None
+    m = FRESHNESS_REGEX.search(text)
+    if not m:
+        return None
+    phrase = m.group(0).lower()
+    if phrase in ("today", "just posted", "new"):
+        return "🆕 Posted today"
+    if "yesterday" in phrase:
+        return "📅 Posted yesterday"
+    return f"📅 Posted {phrase}"
+
+
 def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
     """Best-effort fetch of a job posting's real page text. Search snippets are often just
     a restated title with no real content, so scoring against the snippet alone badly
@@ -398,10 +422,26 @@ def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
         return ""
 
 
-def compute_apply_advice(c, profile, country_cache):
-    """Separate from raw fit — factors in things fit alone doesn't capture: whether you'd
-    need visa sponsorship here and whether this role offers it, and whether the (known)
-    salary clears your floor."""
+def liked_stack_signature(companies):
+    """A simple 'people who liked X also liked Y' signal, built from your own likes rather
+    than other users' data (this is a private single-user tool, so there's no cross-user
+    pool to learn from) — collects tech-stack tokens across everything you've liked so
+    similar postings can get a small recommendation boost."""
+    from collections import Counter
+    counter = Counter()
+    for c in companies.values():
+        if c.get("liked") is True:
+            stack = c.get("stack", "")
+            if stack and stack != "—":
+                for token in stack.split(","):
+                    counter[token.strip().lower()] += 1
+    return counter
+
+
+def compute_match_score(c, profile, country_cache, liked_stack_counter=None):
+    """The overall recommendation score shown as stars — starts from fit, then adjusts for
+    things fit alone doesn't capture: visa fit, salary-floor fit, and similarity to the
+    stack of companies you've already liked (a lightweight 'more like this' signal)."""
     score = c.get("fit", 0)
     reasons = []
 
@@ -425,11 +465,23 @@ def compute_apply_advice(c, profile, country_cache):
             score -= 10
             reasons.append("country avg salary is below your floor")
 
+    if liked_stack_counter:
+        stack = c.get("stack", "")
+        if stack and stack != "—":
+            tokens = [t.strip().lower() for t in stack.split(",")]
+            overlap = sum(1 for t in tokens if t in liked_stack_counter)
+            if overlap:
+                boost = min(15, overlap * 5)
+                score += boost
+                reasons.append("similar stack to companies you liked")
+
     if c.get("liked") is False:
         score -= 30
         reasons.append("you disliked this one")
 
-    return max(0, min(100, round(score))), reasons
+    score = max(0, min(100, round(score)))
+    stars = max(1, min(5, round(score / 20))) if score > 0 else 0
+    return score, reasons, stars
 
 
 # ============================================================================================
@@ -632,6 +684,8 @@ def build_company_record(hit, cv_skills, fetch_full_page):
         "level": extract_level(title),
         "visa_support": extract_visa_support(text_for_scoring),
         "salary_mentioned": extract_salary_mention(text_for_scoring),
+        "posted_freshness": extract_freshness(text_for_scoring),
+        "scouted_at": datetime.now().isoformat(timespec="minutes"),
         "fit": fit,
         "matched_skills": matched,
         "liked": None,
@@ -761,6 +815,22 @@ def view_dashboard():
     st.title("🌍 Country Ranking")
     prof = db["profile"]
 
+    # --- Hero stats ------------------------------------------------------------
+    companies = db["companies"]
+    total_scouted = len(companies)
+    total_liked = sum(1 for c in companies.values() if c.get("liked") is True)
+    total_applied = sum(1 for c in companies.values() if c.get("status") == "Applied")
+    countries_with_data = len(db["country_cache"])
+    liked_fits = [c.get("fit", 0) for c in companies.values() if c.get("liked") is True]
+    avg_liked_fit = round(sum(liked_fits) / len(liked_fits)) if liked_fits else None
+
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Roles scouted", total_scouted)
+    h2.metric("Liked", total_liked)
+    h3.metric("Applied", total_applied)
+    h4.metric("Avg fit of liked roles", f"{avg_liked_fit}%" if avg_liked_fit is not None else "—")
+    st.divider()
+
     countries = country_picker("Countries to evaluate", "dash_countries", prof["countries"])
     if st.button("🔄 Refresh market & visa data"):
         with st.spinner("Searching current salary, cost-of-living and visa data..."):
@@ -833,28 +903,34 @@ def view_dashboard():
         entries = [c for c in entries if c["country"] == picked]
 
     has_cv = bool(db["cv_skills"])
+    liked_stack_counter = liked_stack_signature(db["companies"])
     if has_cv:
-        entries.sort(key=lambda c: c.get("fit", 0), reverse=True)
+        entries.sort(key=lambda c: compute_match_score(c, prof, db["country_cache"], liked_stack_counter)[0],
+                     reverse=True)
     label = f"{COUNTRY_FLAGS.get(picked, '🌍')} {picked} — Companies" if picked != "All countries" \
         else "🌍 All Countries — Companies"
-    st.markdown(f"#### {label}" + (" (sorted by fit to your CV)" if has_cv else ""))
+    st.markdown(f"#### {label}" + (" (sorted by match score)" if has_cv else ""))
     if not has_cv:
-        st.caption("Upload your CV in Profile to rank these by fit — showing them in scouted order for now.")
+        st.caption("Upload your CV in Profile to rank these by match — showing them in scouted order for now.")
 
     if not entries:
         st.info("No scouted companies yet — go to **Companies** and click **Scout all three sources**.")
         return
 
     source_short = {"linkedin": "🔗 LinkedIn", "career_page": "🏢 Career page", "job_board": "📋 Job board"}
-    table_rows = [{
-        "Company": c.get("company_name") or extract_company_name(c["href"]),
-        "Country": c.get("country", "Unknown"),
-        "Source": source_short.get(c.get("source") or determine_source(c.get("href", "")), "—"),
-        "Stack": c.get("stack") or extract_tech_stack(c.get("title", ""), c.get("body", "")),
-        "Role": c.get("title", ""),
-        "Fit %": f"{c.get('fit', 0)}%" if has_cv else "—",
-        "Link": c["href"],
-    } for c in entries]
+    table_rows = []
+    for c in entries:
+        match_pct, _, stars = compute_match_score(c, prof, db["country_cache"], liked_stack_counter)
+        table_rows.append({
+            "Company": c.get("company_name") or extract_company_name(c["href"]),
+            "Country": c.get("country", "Unknown"),
+            "Source": source_short.get(c.get("source") or determine_source(c.get("href", "")), "—"),
+            "Stack": c.get("stack") or extract_tech_stack(c.get("title", ""), c.get("body", "")),
+            "Role": c.get("title", ""),
+            "Match": ("★" * stars + "☆" * (5 - stars)) if has_cv else "—",
+            "Match %": f"{match_pct}%" if has_cv else "—",
+            "Link": c["href"],
+        })
 
     st.dataframe(
         pd.DataFrame(table_rows), use_container_width=True, hide_index=True,
@@ -872,13 +948,22 @@ SOURCE_LABELS = {
 }
 
 
-def _render_role_card(jid, c, prof):
+def _favicon_url(href):
+    try:
+        netloc = urlparse(href).netloc
+        return f"https://www.google.com/s2/favicons?sz=64&domain={netloc}"
+    except Exception:
+        return ""
+
+
+def _render_role_card(jid, c, prof, liked_stack_counter=None, rank=None):
     pills = ''.join(f'<span class="pill">{s}</span>' for s in c.get('matched_skills', [])[:8])
     body_preview = c['body'][:280] + ('...' if len(c['body']) > 280 else '')
 
     level = c.get("level", "Not specified")
     visa = c.get("visa_support", "Not specified")
     visa_icon = {"Yes": "✅", "No": "❌", "Not specified": "❔"}.get(visa, "❔")
+    freshness = c.get("posted_freshness")
 
     salary_mentioned = c.get("salary_mentioned")
     country_est = db["country_cache"].get(c.get("country", ""), {}).get("salary_eur")
@@ -890,22 +975,30 @@ def _render_role_card(jid, c, prof):
     else:
         salary_line = "💰 <span class='small-muted'>Not stated — refresh market data for this country to get an estimate</span>"
 
-    advice_pct, advice_reasons = compute_apply_advice(c, prof, db["country_cache"])
-    advice_color = ACCENT if advice_pct >= 60 else ("#ffce54" if advice_pct >= 35 else "#8b909c")
-    advice_tooltip = "; ".join(advice_reasons) if advice_reasons else "based on fit alone"
+    match_pct, match_reasons, stars = compute_match_score(c, prof, db["country_cache"], liked_stack_counter)
+    match_color = ACCENT if match_pct >= 60 else ("#ffce54" if match_pct >= 35 else "#8b909c")
+    match_tooltip = "; ".join(match_reasons) if match_reasons else "based on fit alone"
+    star_html = "★" * stars + "☆" * (5 - stars)
+
+    ribbon = ('<span class="pill" style="background:#ffce54; color:#111; border-color:#ffce54; '
+              'font-weight:800;">🌟 Top pick</span>') if rank is not None and rank < 3 and match_pct >= 50 else ""
+    freshness_pill = f'<span class="pill">{freshness}</span>' if freshness else ""
+    favicon = _favicon_url(c["href"])
+    logo_html = (f'<img src="{favicon}" width="20" height="20" style="border-radius:4px; '
+                 f'vertical-align:middle; margin-right:6px;" onerror="this.style.display=\'none\'">') if favicon else ""
 
     card_html = (
         '<div class="card">'
         '<div style="display:flex; justify-content:space-between; align-items:center;">'
-        f'<h3 style="margin:0;">{c["title"]}</h3>'
-        f'<span class="fit-badge">{c.get("fit", 0)}% fit</span>'
+        f'<h3 style="margin:0;">{logo_html}{c["title"]}</h3>'
+        f'<span class="fit-badge" title="{match_tooltip}">{star_html} · {match_pct}%</span>'
         '</div>'
         f'<p class="small-muted">📍 {c["country"]} · 🏢 {c.get("company_name","")}</p>'
         f'<div style="margin:8px 0;">'
+        f'{ribbon}'
         f'<span class="pill">🎚 {level}</span>'
         f'<span class="pill">{visa_icon} Visa: {visa}</span>'
-        f'<span class="pill" title="{advice_tooltip}" '
-        f'style="color:{advice_color}; border-color:{advice_color};">👉 Apply advice: {advice_pct}%</span>'
+        f'{freshness_pill}'
         '</div>'
         f'<p style="margin:6px 0;">{salary_line}</p>'
         f'<p style="color:#c9cdd6; margin:10px 0;">{body_preview}</p>'
@@ -1040,6 +1133,8 @@ def view_companies():
                         c["salary_mentioned"] = extract_salary_mention(text_for_scoring)
                         c["company_name"] = c.get("company_name") or extract_company_name(c.get("href", ""))
                         c["source"] = c.get("source") or determine_source(c.get("href", ""))
+                        c["posted_freshness"] = extract_freshness(text_for_scoring)
+                        c.setdefault("scouted_at", None)
                         updated += 1
                     except Exception:
                         failed += 1
@@ -1071,12 +1166,16 @@ def view_companies():
         level_filter = st.multiselect("Level", LEVEL_OPTIONS, default=[], help=LEVEL_TOOLTIP)
     with f4:
         visa_filter = st.selectbox("Visa support mentioned", ["Any", "Yes", "No"])
-    f5, f6 = st.columns(2)
+    f5, f6, f7 = st.columns(3)
     with f5:
         liked_only = st.checkbox("Liked only")
     with f6:
         hide_decided = st.checkbox("Hide applied/skipped", value=True)
+    with f7:
+        sort_by = st.selectbox("Sort by", ["🌟 Best match", "🆕 Recently scouted", "Company name (A-Z)"])
     st.divider()
+
+    liked_stack_counter = liked_stack_signature(db["companies"])
 
     entries = [(jid, c) for jid, c in db["companies"].items()
                if (c.get("source") or determine_source(c.get("href", ""))) == subview]
@@ -1091,15 +1190,34 @@ def view_companies():
     if visa_filter != "Any":
         entries = [(j, c) for j, c in entries if c.get("visa_support") == visa_filter]
     entries = [(j, c) for j, c in entries if c.get("fit", 0) >= min_fit]
-    entries.sort(key=lambda jc: jc[1].get("fit", 0), reverse=True)
+
+    if sort_by == "🌟 Best match":
+        entries.sort(key=lambda jc: compute_match_score(jc[1], prof, db["country_cache"], liked_stack_counter)[0],
+                     reverse=True)
+    elif sort_by == "🆕 Recently scouted":
+        entries.sort(key=lambda jc: jc[1].get("scouted_at") or "", reverse=True)
+    else:
+        entries.sort(key=lambda jc: (jc[1].get("company_name") or "").lower())
 
     if not entries:
         st.info("No roles here yet matching these filters. Use **Search & scout settings** above.")
         return
 
-    for jid, c in entries:
+    st.caption(f"{len(entries)} role(s) match your filters.")
+
+    page_key = f"show_count_{subview}"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 10
+    show_count = st.session_state[page_key]
+
+    for rank, (jid, c) in enumerate(entries[:show_count]):
         with st.container():
-            _render_role_card(jid, c, prof)
+            _render_role_card(jid, c, prof, liked_stack_counter=liked_stack_counter, rank=rank)
+
+    if show_count < len(entries):
+        if st.button(f"⬇️ Show more ({len(entries) - show_count} remaining)", use_container_width=True):
+            st.session_state[page_key] += 10
+            st.rerun()
 
 
 # ============================================================================================
@@ -1217,6 +1335,7 @@ if "profile_subview" not in st.session_state:
 
 with st.sidebar:
     st.markdown("### 🐆 Job Copilot")
+    st.caption("Your private job-search command center")
 
     if st.button("🌍 Dashboard", key="nav_dashboard", use_container_width=True,
                  type="primary" if st.session_state["nav"] == "Dashboard" else "secondary"):
