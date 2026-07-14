@@ -71,12 +71,24 @@ h1, h2, h3 {{ font-weight: 800 !important; letter-spacing: -0.02em; }}
 
 DB_PATH = "copilot_db.json"
 DEFAULT_COUNTRIES = ["Germany", "Netherlands", "United Kingdom", "Belgium", "France",
-                     "Switzerland", "Ireland", "Spain", "Portugal", "Canada"]
+                     "Switzerland", "Ireland", "Spain", "Portugal", "Poland", "Czech Republic",
+                     "Sweden", "Denmark", "Austria", "Italy", "Canada", "United States"]
 
 COUNTRY_FLAGS = {
     "Germany": "🇩🇪", "Netherlands": "🇳🇱", "United Kingdom": "🇬🇧", "Belgium": "🇧🇪",
     "France": "🇫🇷", "Switzerland": "🇨🇭", "Ireland": "🇮🇪", "Spain": "🇪🇸",
     "Portugal": "🇵🇹", "Canada": "🇨🇦", "Poland": "🇵🇱", "Czech Republic": "🇨🇿",
+    "Sweden": "🇸🇪", "Denmark": "🇩🇰", "Austria": "🇦🇹", "Italy": "🇮🇹", "United States": "🇺🇸",
+}
+
+REGIONS = {
+    "Europe": ["Germany", "Netherlands", "United Kingdom", "Belgium", "France", "Switzerland",
+               "Ireland", "Spain", "Portugal", "Poland", "Czech Republic", "Sweden", "Denmark",
+               "Austria", "Italy"],
+    "North America": ["Canada", "United States"],
+    "DACH (Germany/Austria/Switzerland)": ["Germany", "Austria", "Switzerland"],
+    "Nordics": ["Sweden", "Denmark"],
+    "Benelux": ["Belgium", "Netherlands"],
 }
 
 VISA_ICON = {"green": "✅", "yellow": "⚠️", "red": "❌"}
@@ -127,6 +139,29 @@ def save_db(data):
 if "db" not in st.session_state:
     st.session_state.db = load_db()
 db = st.session_state.db
+
+
+def country_picker(label, key, default):
+    """Country multiselect with a 'quick add region' control next to it, so picking
+    'Europe' or 'North America' adds every country in that region in one click instead
+    of selecting each one individually. The value lives in session_state[key] so the
+    region-add button can update it and have the multiselect reflect it on rerun."""
+    if key not in st.session_state:
+        st.session_state[key] = [c for c in default if c in DEFAULT_COUNTRIES]
+    else:
+        st.session_state[key] = [c for c in st.session_state[key] if c in DEFAULT_COUNTRIES]
+
+    col1, col2 = st.columns([2, 1])
+    with col2:
+        region_pick = st.selectbox("Quick add region", ["—"] + list(REGIONS.keys()), key=f"{key}_region_pick")
+        if st.button("➕ Add region", key=f"{key}_region_btn", use_container_width=True):
+            if region_pick != "—":
+                merged = list(dict.fromkeys(st.session_state[key] + REGIONS[region_pick]))
+                st.session_state[key] = merged
+                st.rerun()
+    with col1:
+        selected = st.multiselect(label, DEFAULT_COUNTRIES, key=key)
+    return selected
 
 
 def get_client():
@@ -559,8 +594,7 @@ def view_dashboard():
     st.title("🌍 Country Ranking")
     prof = db["profile"]
 
-    countries = st.multiselect("Countries to evaluate", DEFAULT_COUNTRIES + prof["countries"],
-                                default=prof["countries"])
+    countries = country_picker("Countries to evaluate", "dash_countries", prof["countries"])
     if st.button("🔄 Refresh market & visa data", use_container_width=False):
         with st.spinner("Searching current salary, cost-of-living and visa data..."):
             refresh_country_data(countries, prof["role"], prof["seniority"])
@@ -685,8 +719,7 @@ def view_companies():
     with st.sidebar:
         st.subheader("Search")
         role = st.text_input("Target role", prof["role"])
-        countries = st.multiselect("Countries", DEFAULT_COUNTRIES + prof["countries"],
-                                    default=prof["countries"])
+        countries = country_picker("Countries", "companies_countries", prof["countries"])
         results_per_country = st.slider("Results per country", 5, 25, 10)
         fetch_full_page = st.checkbox("Fetch full page for better stack/fit detection (slower)", value=True)
 
@@ -914,6 +947,7 @@ def view_profile():
     tabs = st.tabs(["Preferences", "Master CV", "Liked / Disliked", "Application Tracker"])
 
     with tabs[0]:
+        prof["countries"] = country_picker("Target countries", "profile_countries", prof["countries"])
         c1, c2 = st.columns(2)
         with c1:
             prof["role"] = st.text_input("Target role", prof["role"])
@@ -922,7 +956,6 @@ def view_profile():
                 index=["Junior", "Mid-level", "Senior", "Staff/Lead"].index(prof["seniority"])
                 if prof["seniority"] in ["Junior", "Mid-level", "Senior", "Staff/Lead"] else 1,
             )
-            prof["countries"] = st.multiselect("Target countries", DEFAULT_COUNTRIES, default=prof["countries"])
             prof["work_mode"] = st.selectbox("Work mode", ["Remote", "Hybrid", "Onsite"],
                                               index=["Remote", "Hybrid", "Onsite"].index(prof["work_mode"]))
             prof["salary_floor"] = st.number_input("Minimum salary (EUR/yr)", value=prof["salary_floor"], step=1000)
