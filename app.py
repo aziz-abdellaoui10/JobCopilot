@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import pypdf
+import requests
 from groq import Groq
 
 try:
@@ -173,13 +174,16 @@ def extract_cv_skills(cv_text, tex_source):
 # EXPLAINABLE FIT SCORING — no black box: score = keyword overlap, matches shown to user
 # --------------------------------------------------------------------------------------
 def score_job_fit(job_text, cv_skills):
+    """Transparent fit score: percentage based on how many of the candidate's known skills show
+    up in the posting, scaled against a fixed 'strong match' threshold rather than the size of
+    the candidate's whole skill list — dividing by the full CV skill count (as before) punished
+    anyone with a long CV, since a short job snippet will never mention most of a 60-skill list."""
     if not cv_skills:
         return 0, []
     text_low = job_text.lower()
     matched = [s for s in cv_skills if s.lower() in text_low]
-    score = round(100 * len(matched) / max(len(cv_skills), 1))
-    # cap so a huge CV doesn't need to match everything to hit 100
-    score = min(100, round(score * 2.2))
+    STRONG_MATCH_COUNT = 5  # 5+ matched skills counts as a full/100% fit
+    score = min(100, round(100 * len(matched) / STRONG_MATCH_COUNT))
     return score, matched
 
 
@@ -216,10 +220,33 @@ def extract_tech_stack(title, body):
     return ", ".join(found[:5]) if found else "—"
 
 
+def fetch_page_text(url, timeout=6, max_chars=4000):
+    """Best-effort fetch of a job posting's page text, for stack detection and fit scoring.
+    Search snippets are often just a title restated ('Jobs at JetBrains') with no real content,
+    so scoring against the snippet alone badly under-detects both tech stack and fit. Fails
+    silently (returns '') on network errors, blocks, or JS-only pages — callers fall back to
+    the snippet in that case."""
+    try:
+        resp = requests.get(
+            url, timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; JobCopilot/1.0; personal use)"},
+        )
+        if resp.status_code != 200:
+            return ""
+        html = resp.text
+        html = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
 # --------------------------------------------------------------------------------------
 # SCOUTING ENGINE — searches company career pages, prefers first-party links over boards
 # --------------------------------------------------------------------------------------
 CAREER_SITE_FILTER = "(site:lever.co OR site:greenhouse.io OR site:ashbyhq.com OR site:workday.com OR site:jobs.smartrecruiters.com)"
+ALT_CAREER_SITE_FILTER = "(site:workable.com OR site:personio.de OR site:teamtailor.com OR site:jobvite.com OR site:breezy.hr OR site:recruitee.com)"
 
 
 def _try_query(ddgs, query, max_results):
@@ -231,23 +258,25 @@ def _try_query(ddgs, query, max_results):
         return [], str(e)
 
 
-def search_roles(role, countries, max_results_per_query=8):
+def search_roles(role, countries, max_results_per_query=8, site_filter=CAREER_SITE_FILTER, query_extra=""):
     """Search each country with a narrow (site-restricted) query first; if that comes back
     empty, retry once with a broader query before giving up on that country. Most of the
     'No results found' failures came from the narrow query genuinely being too strict for
     that country/backend combo, not purely rate limiting — so a fallback query recovers a
-    lot of them. A jittered delay between countries also reduces rate-limit hits."""
+    lot of them. A jittered delay between countries also reduces rate-limit hits.
+    `site_filter`/`query_extra` let callers target a different set of ATS hosts (e.g. for
+    'load more') so repeated searches surface new postings instead of the same top hits."""
     results, errors = [], []
     with DDGS() as ddgs:
         for i, country in enumerate(countries):
             time.sleep(0.5 + 0.2 * (i % 3))
 
-            narrow_query = f'{CAREER_SITE_FILTER} "{role}" {country}'
+            narrow_query = f'{site_filter} "{role}" {country} {query_extra}'.strip()
             hits, err = _try_query(ddgs, narrow_query, max_results_per_query)
 
             if not hits:
                 time.sleep(0.6)
-                broad_query = f"{role} jobs {country} careers"
+                broad_query = f"{role} jobs {country} careers {query_extra}".strip()
                 hits, err2 = _try_query(ddgs, broad_query, max_results_per_query)
                 if not hits and err2:
                     err = err2
@@ -519,7 +548,8 @@ def view_dashboard():
 
     table_rows = [{
         "Company": c.get("company_name") or extract_company_name(c["href"]),
-        "Stack": c.get("stack") or extract_tech_stack(c.get("title", ""), c.get("body", "")),
+        "Country": c.get("country", "Unknown"),
+        "Stack": c.get("stack") or extract_tech_stack(c.get("title", "") + " " + c.get("body", ""), ""),
         "Role": c.get("title", ""),
         "Fit %": f"{c.get('fit', 0)}%" if has_cv else "—",
         "Career Page": c["href"],
@@ -545,34 +575,76 @@ def view_companies():
         role = st.text_input("Target role", prof["role"])
         countries = st.multiselect("Countries", DEFAULT_COUNTRIES + prof["countries"],
                                     default=prof["countries"])
+        results_per_country = st.slider("Results per country", 5, 25, 10)
+        fetch_full_page = st.checkbox("Fetch full page for better stack/fit detection (slower)", value=True)
+
+        def _ingest(hits):
+            new_count = 0
+            for h in hits:
+                jid = job_id(h["href"], h.get("title", ""))
+                if jid in db["companies"]:
+                    continue  # never re-show something already tracked
+                text_for_scoring = h.get("title", "") + " " + h.get("body", "")
+                if fetch_full_page:
+                    page_text = fetch_page_text(h["href"])
+                    if page_text:
+                        text_for_scoring += " " + page_text
+                fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
+                db["companies"][jid] = {
+                    "title": h.get("title", "Untitled role"),
+                    "body": h.get("body", ""),
+                    "href": h["href"],
+                    "country": h.get("_country", "Unknown"),
+                    "company_name": extract_company_name(h["href"]),
+                    "stack": extract_tech_stack(text_for_scoring, ""),
+                    "fit": fit,
+                    "matched_skills": matched,
+                    "liked": None,
+                    "status": None,
+                    "logged_at": None,
+                }
+                new_count += 1
+            return new_count
+
         if st.button("🔭 Scout new roles", use_container_width=True):
             if not db["cv_skills"]:
                 st.warning("Upload & sync your CV in Profile first for real fit scoring.")
             with st.spinner(f"Searching company career pages for {role}..."):
-                hits, errors = search_roles(role, countries)
-                for h in hits:
-                    jid = job_id(h["href"], h.get("title", ""))
-                    if jid in db["companies"]:
-                        continue  # never re-show something already tracked
-                    fit, matched = score_job_fit(h.get("title", "") + " " + h.get("body", ""), db["cv_skills"])
-                    db["companies"][jid] = {
-                        "title": h.get("title", "Untitled role"),
-                        "body": h.get("body", ""),
-                        "href": h["href"],
-                        "country": h.get("_country", "Unknown"),
-                        "company_name": extract_company_name(h["href"]),
-                        "stack": extract_tech_stack(h.get("title", ""), h.get("body", "")),
-                        "fit": fit,
-                        "matched_skills": matched,
-                        "liked": None,
-                        "status": None,
-                        "logged_at": None,
-                    }
+                hits, errors = search_roles(role, countries, max_results_per_query=results_per_country)
+                new_count = _ingest(hits)
                 save_db(db)
                 if errors:
                     st.warning(f"{len(errors)} search querie(s) failed (rate-limited or blocked): "
                                + "; ".join(errors[:3]))
-                st.success(f"Found {len(hits)} candidate roles ({sum(1 for h in hits if job_id(h['href'], h.get('title','')) in db['companies'])} new).")
+                st.success(f"Found {len(hits)} candidate roles ({new_count} new).")
+
+        if st.button("🔁 Load more (different job boards)", use_container_width=True):
+            with st.spinner("Searching additional ATS platforms for more roles..."):
+                hits, errors = search_roles(role, countries, max_results_per_query=results_per_country,
+                                             site_filter=ALT_CAREER_SITE_FILTER)
+                new_count = _ingest(hits)
+                save_db(db)
+                if errors:
+                    st.warning(f"{len(errors)} search querie(s) failed: " + "; ".join(errors[:3]))
+                st.success(f"Found {len(hits)} candidate roles ({new_count} new).")
+
+        if st.button("♻️ Recompute stack & fit for existing entries", use_container_width=True):
+            with st.spinner("Re-scoring already-scouted roles with the improved detection..."):
+                updated = 0
+                for jid, c in db["companies"].items():
+                    text_for_scoring = c.get("title", "") + " " + c.get("body", "")
+                    if fetch_full_page:
+                        page_text = fetch_page_text(c["href"])
+                        if page_text:
+                            text_for_scoring += " " + page_text
+                    fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
+                    c["fit"] = fit
+                    c["matched_skills"] = matched
+                    c["stack"] = extract_tech_stack(text_for_scoring, "")
+                    c["company_name"] = c.get("company_name") or extract_company_name(c["href"])
+                    updated += 1
+                save_db(db)
+                st.success(f"Recomputed {updated} entries.")
 
         st.divider()
         filter_country = st.selectbox(
