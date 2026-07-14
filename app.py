@@ -220,21 +220,35 @@ def extract_tech_stack(title, body):
     return ", ".join(found[:5]) if found else "—"
 
 
-def fetch_page_text(url, timeout=6, max_chars=4000):
+def fetch_page_text(url, timeout=6, max_chars=4000, max_download_bytes=300_000):
     """Best-effort fetch of a job posting's page text, for stack detection and fit scoring.
     Search snippets are often just a title restated ('Jobs at JetBrains') with no real content,
     so scoring against the snippet alone badly under-detects both tech stack and fit. Fails
-    silently (returns '') on network errors, blocks, or JS-only pages — callers fall back to
-    the snippet in that case."""
+    silently (returns '') on network errors, blocks, non-http links, or JS-only pages — callers
+    fall back to the snippet in that case. Downloads are capped so one huge or slow page can't
+    stall or blow up memory on a small hosting instance."""
+    if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+        return ""
     try:
         resp = requests.get(
-            url, timeout=timeout,
+            url, timeout=timeout, stream=True,
             headers={"User-Agent": "Mozilla/5.0 (compatible; JobCopilot/1.0; personal use)"},
         )
         if resp.status_code != 200:
             return ""
-        html = resp.text
-        html = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+        chunks, total = [], 0
+        for chunk in resp.iter_content(chunk_size=8192, decode_unicode=False):
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_download_bytes:
+                break
+        raw = b"".join(chunks)
+        html = raw.decode(resp.encoding or "utf-8", errors="ignore")
+        html = html[:max_download_bytes]  # extra safety before regex work
+        html = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ",
+                      html, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<[^>]+>", " ", html)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:max_chars]
@@ -581,29 +595,35 @@ def view_companies():
         def _ingest(hits):
             new_count = 0
             for h in hits:
-                jid = job_id(h["href"], h.get("title", ""))
-                if jid in db["companies"]:
-                    continue  # never re-show something already tracked
-                text_for_scoring = h.get("title", "") + " " + h.get("body", "")
-                if fetch_full_page:
-                    page_text = fetch_page_text(h["href"])
-                    if page_text:
-                        text_for_scoring += " " + page_text
-                fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
-                db["companies"][jid] = {
-                    "title": h.get("title", "Untitled role"),
-                    "body": h.get("body", ""),
-                    "href": h["href"],
-                    "country": h.get("_country", "Unknown"),
-                    "company_name": extract_company_name(h["href"]),
-                    "stack": extract_tech_stack(text_for_scoring, ""),
-                    "fit": fit,
-                    "matched_skills": matched,
-                    "liked": None,
-                    "status": None,
-                    "logged_at": None,
-                }
-                new_count += 1
+                try:
+                    href = h.get("href")
+                    if not href:
+                        continue
+                    jid = job_id(href, h.get("title", ""))
+                    if jid in db["companies"]:
+                        continue  # never re-show something already tracked
+                    text_for_scoring = h.get("title", "") + " " + h.get("body", "")
+                    if fetch_full_page:
+                        page_text = fetch_page_text(href)
+                        if page_text:
+                            text_for_scoring += " " + page_text
+                    fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
+                    db["companies"][jid] = {
+                        "title": h.get("title", "Untitled role"),
+                        "body": h.get("body", ""),
+                        "href": href,
+                        "country": h.get("_country", "Unknown"),
+                        "company_name": extract_company_name(href),
+                        "stack": extract_tech_stack(text_for_scoring, ""),
+                        "fit": fit,
+                        "matched_skills": matched,
+                        "liked": None,
+                        "status": None,
+                        "logged_at": None,
+                    }
+                    new_count += 1
+                except Exception:
+                    continue
             return new_count
 
         if st.button("🔭 Scout new roles", use_container_width=True):
@@ -630,21 +650,28 @@ def view_companies():
 
         if st.button("♻️ Recompute stack & fit for existing entries", use_container_width=True):
             with st.spinner("Re-scoring already-scouted roles with the improved detection..."):
-                updated = 0
-                for jid, c in db["companies"].items():
-                    text_for_scoring = c.get("title", "") + " " + c.get("body", "")
-                    if fetch_full_page:
-                        page_text = fetch_page_text(c["href"])
-                        if page_text:
-                            text_for_scoring += " " + page_text
-                    fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
-                    c["fit"] = fit
-                    c["matched_skills"] = matched
-                    c["stack"] = extract_tech_stack(text_for_scoring, "")
-                    c["company_name"] = c.get("company_name") or extract_company_name(c["href"])
-                    updated += 1
+                updated, failed = 0, 0
+                for jid, c in list(db["companies"].items()):
+                    try:
+                        text_for_scoring = c.get("title", "") + " " + c.get("body", "")
+                        if fetch_full_page:
+                            page_text = fetch_page_text(c.get("href", ""))
+                            if page_text:
+                                text_for_scoring += " " + page_text
+                        fit, matched = score_job_fit(text_for_scoring, db["cv_skills"])
+                        c["fit"] = fit
+                        c["matched_skills"] = matched
+                        c["stack"] = extract_tech_stack(text_for_scoring, "")
+                        c["company_name"] = c.get("company_name") or extract_company_name(c.get("href", ""))
+                        updated += 1
+                    except Exception:
+                        failed += 1
+                        continue
                 save_db(db)
-                st.success(f"Recomputed {updated} entries.")
+                msg = f"Recomputed {updated} entries."
+                if failed:
+                    msg += f" Skipped {failed} that errored out."
+                st.success(msg)
 
         st.divider()
         filter_country = st.selectbox(
