@@ -434,39 +434,51 @@ def view_dashboard():
         medals = {0: "🥇", 1: "🥈", 2: "🥉"}
 
         st.subheader("Final Ranking Table — Your Profile Specific")
+        row_tpl = (
+            '<tr style="border-top:1px solid {border};">'
+            '<td style="padding:10px 8px;">{priority}</td>'
+            '<td style="padding:10px 8px;">{flag} {country}</td>'
+            '<td style="padding:10px 8px;">{surplus}</td>'
+            '<td style="padding:10px 8px;">{visa_icon} {visa_weeks}</td>'
+            '<td style="padding:10px 8px; color:#ffce54;">{qol}</td>'
+            '<td style="padding:10px 8px; color:#ffce54;">{remote}</td>'
+            '<td style="padding:10px 8px; color:#c9cdd6;">{edge}</td>'
+            '</tr>'
+        )
         rows_html = ""
         for i, country in enumerate(ranked):
             d = db["country_cache"][country]
-            flag = COUNTRY_FLAGS.get(country, "🏳️")
-            priority = medals.get(i, str(i + 1))
             surplus_range = f"€{d['monthly_surplus_low']:,}-{d['monthly_surplus_high']:,}" \
                 if d.get("monthly_surplus_high") else "—"
-            visa_icon = VISA_ICON.get(d.get("visa_favorability"), "⚠️")
-            rows_html += f"""
-            <tr style="border-top:1px solid {BORDER};">
-                <td style="padding:10px 8px;">{priority}</td>
-                <td style="padding:10px 8px;">{flag} {country}</td>
-                <td style="padding:10px 8px;">{surplus_range}</td>
-                <td style="padding:10px 8px;">{visa_icon} {d.get('visa_speed_weeks','—')}</td>
-                <td style="padding:10px 8px; color:#ffce54;">{_stars(d.get('qol_stars',0))}</td>
-                <td style="padding:10px 8px; color:#ffce54;">{_stars(d.get('remote_culture_stars',0))}</td>
-                <td style="padding:10px 8px; color:#c9cdd6;">{d.get('edge','')}</td>
-            </tr>"""
+            rows_html += row_tpl.format(
+                border=BORDER,
+                priority=medals.get(i, str(i + 1)),
+                flag=COUNTRY_FLAGS.get(country, "🏳️"),
+                country=country,
+                surplus=surplus_range,
+                visa_icon=VISA_ICON.get(d.get("visa_favorability"), "⚠️"),
+                visa_weeks=d.get("visa_speed_weeks", "—"),
+                qol=_stars(d.get("qol_stars", 0)),
+                remote=_stars(d.get("remote_culture_stars", 0)),
+                edge=d.get("edge", ""),
+            )
 
-        st.markdown(f"""
-        <table style="width:100%; border-collapse:collapse; font-size:14px;">
-            <tr style="color:#8b909c; text-align:left;">
-                <th style="padding:6px 8px;">Priority</th>
-                <th style="padding:6px 8px;">Country</th>
-                <th style="padding:6px 8px;">Est. Monthly Surplus</th>
-                <th style="padding:6px 8px;">Visa Speed</th>
-                <th style="padding:6px 8px;">QoL</th>
-                <th style="padding:6px 8px;">Remote/Hybrid Culture</th>
-                <th style="padding:6px 8px;">Your Edge</th>
-            </tr>
-            {rows_html}
-        </table>
-        """, unsafe_allow_html=True)
+        header = (
+            '<tr style="color:#8b909c; text-align:left;">'
+            '<th style="padding:6px 8px;">Priority</th>'
+            '<th style="padding:6px 8px;">Country</th>'
+            '<th style="padding:6px 8px;">Est. Monthly Surplus</th>'
+            '<th style="padding:6px 8px;">Visa Speed</th>'
+            '<th style="padding:6px 8px;">QoL</th>'
+            '<th style="padding:6px 8px;">Remote/Hybrid Culture</th>'
+            '<th style="padding:6px 8px;">Your Edge</th>'
+            '</tr>'
+        )
+        table_html = (
+            '<table style="width:100%; border-collapse:collapse; font-size:14px;">'
+            + header + rows_html + '</table>'
+        )
+        st.markdown(table_html, unsafe_allow_html=True)
 
         oldest = min(db["country_cache"][c]["updated_at"] for c in cached)
         st.markdown(f'<span class="last-updated">Data as of {oldest} — AI-estimated from live web search '
@@ -584,17 +596,20 @@ def view_companies():
 
     for jid, c in entries:
         with st.container():
-            st.markdown(f"""
-                <div class="card">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3 style="margin:0;">{c['title']}</h3>
-                        <span class="fit-badge">{c.get('fit', 0)}% fit</span>
-                    </div>
-                    <p class="small-muted">📍 {c['country']}</p>
-                    <p style="color:#c9cdd6; margin:10px 0;">{c['body'][:280]}{'...' if len(c['body'])>280 else ''}</p>
-                    <div>{''.join(f'<span class="pill">{s}</span>' for s in c.get('matched_skills', [])[:8])}</div>
-                </div>
-            """, unsafe_allow_html=True)
+            pills = ''.join(f'<span class="pill">{s}</span>' for s in c.get('matched_skills', [])[:8])
+            body_preview = c['body'][:280] + ('...' if len(c['body']) > 280 else '')
+            card_html = (
+                '<div class="card">'
+                '<div style="display:flex; justify-content:space-between; align-items:center;">'
+                f'<h3 style="margin:0;">{c["title"]}</h3>'
+                f'<span class="fit-badge">{c.get("fit", 0)}% fit</span>'
+                '</div>'
+                f'<p class="small-muted">📍 {c["country"]}</p>'
+                f'<p style="color:#c9cdd6; margin:10px 0;">{body_preview}</p>'
+                f'<div>{pills}</div>'
+                '</div>'
+            )
+            st.markdown(card_html, unsafe_allow_html=True)
 
             b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1.4])
             if b1.button("👍 Like", key=f"like_{jid}"):
