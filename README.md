@@ -4,6 +4,28 @@ A private, local-use Streamlit app that researches countries/companies fitting y
 tailors your CV per role, and tracks your applications — rebuilt clean from everything we
 iterated on.
 
+## Data persistence — read this if you lost data after a restart
+
+The app stores everything in a single compact JSON file (`copilot_db.json`) next to
+`app.py` — no external database, by design. That file is written to disk every time you
+change something, and on your **own machine** it will just sit there permanently across
+restarts.
+
+**If you're running this on shared/cloud hosting (e.g. Streamlit Community Cloud), that
+file can be wiped whenever the container restarts, gets redeployed, or wakes up from
+sleep** — the container's disk isn't guaranteed to persist, independent of anything the
+app does. This is the most likely explanation if data disappeared after a restart; it
+isn't a bug in the storage code.
+
+The fix: **Profile → Backup & Restore**
+- **Export** downloads your entire current state (profile, scouted roles, likes,
+  application history) as a single compact `.json` file.
+- **Restore** uploads that file back in, replacing whatever's currently in the app.
+
+Get in the habit of exporting after a scouting session if you're on shared hosting, or
+just run the app locally (`streamlit run app.py` on your own machine) where this isn't a
+concern at all.
+
 ## Setup
 
 1. Create `.streamlit/secrets.toml` next to `app.py`:
