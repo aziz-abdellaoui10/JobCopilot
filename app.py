@@ -192,24 +192,33 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 # ============================================================================================
 # PERSISTENCE
 # ============================================================================================
+def _backfill_schema(data):
+    """Fills in any keys added since a given db was last saved, so older exports/files
+    keep working after the app evolves."""
+    for k, v in DEFAULT_DB.items():
+        data.setdefault(k, v)
+    for k, v in DEFAULT_DB["profile"].items():
+        data["profile"].setdefault(k, v)
+    return data
+
+
 def load_db():
     if not os.path.exists(DB_PATH):
         return json.loads(json.dumps(DEFAULT_DB))
     try:
         with open(DB_PATH, "r") as f:
             data = json.load(f)
-        for k, v in DEFAULT_DB.items():
-            data.setdefault(k, v)
-        for k, v in DEFAULT_DB["profile"].items():
-            data["profile"].setdefault(k, v)
-        return data
+        return _backfill_schema(data)
     except Exception:
         return json.loads(json.dumps(DEFAULT_DB))
 
 
 def save_db(data):
+    # Compact on-disk format (no indentation/extra whitespace) — keeps the file as small
+    # as possible, which matters more here than human-readability since nobody edits this
+    # file by hand.
     with open(DB_PATH, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, separators=(",", ":"))
 
 
 if "db" not in st.session_state:
@@ -665,7 +674,7 @@ def build_company_record(hit, cv_skills, fetch_full_page):
     when possible, then score fit and detect stack/level/visa/salary from that richer text."""
     href = hit.get("href")
     title = hit.get("title", "Untitled role")
-    body = hit.get("body", "")
+    body = (hit.get("body", "") or "")[:500]  # only the snippet is stored, not the fetched page text
     text_for_scoring = f"{title} {body}"
     if fetch_full_page:
         page_text = fetch_page_text(href)
@@ -829,6 +838,9 @@ def view_dashboard():
     h2.metric("Liked", total_liked)
     h3.metric("Applied", total_applied)
     h4.metric("Avg fit of liked roles", f"{avg_liked_fit}%" if avg_liked_fit is not None else "—")
+    if total_scouted > 0:
+        st.caption("💾 Running on shared/cloud hosting? Back this up regularly — "
+                   "Profile → Backup & Restore.")
     st.divider()
 
     countries = country_picker("Countries to evaluate", "dash_countries", prof["countries"])
@@ -1318,12 +1330,53 @@ def view_profile():
             if not per_country.empty:
                 st.bar_chart(per_country)
 
+    elif subview == "Backup & Restore":
+        st.warning(
+            "If you're running this on shared/cloud hosting (e.g. Streamlit Community Cloud), "
+            "the app's local storage can be wiped on a restart, redeploy, or sleep/wake cycle — "
+            "that's most likely why data disappeared. This isn't a database bug; it's the "
+            "container's disk not persisting. The reliable fix is to keep your own backup file "
+            "and restore it after a restart, or run the app locally where the file just sits on "
+            "your disk permanently."
+        )
+
+        st.subheader("⬇️ Export")
+        backup_bytes = json.dumps(db, separators=(",", ":")).encode("utf-8")
+        size_kb = len(backup_bytes) / 1024
+        st.caption(f"Current data: {len(db['companies'])} scouted role(s), "
+                   f"{size_kb:.1f} KB compressed.")
+        st.download_button(
+            "Download backup (.json)", backup_bytes,
+            file_name=f"job_copilot_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json", use_container_width=True,
+        )
+
+        st.subheader("⬆️ Restore")
+        st.caption("Uploading a backup replaces everything currently in the app — profile, "
+                   "scouted roles, likes, and application history.")
+        restore_file = st.file_uploader("Choose a backup .json file", type="json", key="restore_uploader")
+        if restore_file is not None:
+            if st.button("Restore this backup", use_container_width=True, type="primary"):
+                try:
+                    restored = json.loads(restore_file.getvalue().decode("utf-8"))
+                    if not isinstance(restored, dict) or "profile" not in restored:
+                        st.error("This doesn't look like a Job Copilot backup file.")
+                    else:
+                        restored = _backfill_schema(restored)
+                        db.clear()
+                        db.update(restored)
+                        save_db(db)
+                        st.success("Restored. Reloading...")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't read that file: {e}")
+
 
 # ============================================================================================
 # NAVIGATION — collapsible tree in the sidebar (Dashboard is a direct link; Companies and
 # Profile expand to reveal their sub-views, each of which becomes the whole main page)
 # ============================================================================================
-PROFILE_SUBVIEWS = ["Preferences", "Master CV", "Liked / Disliked", "Application Tracker"]
+PROFILE_SUBVIEWS = ["Preferences", "Master CV", "Liked / Disliked", "Application Tracker", "Backup & Restore"]
 COMPANIES_SUBVIEWS = ["linkedin", "career_page", "job_board"]
 
 if "nav" not in st.session_state:
